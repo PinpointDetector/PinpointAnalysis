@@ -1,0 +1,4 @@
+src/analysis/data/**
+src/analysis/__pycache__/**
+src/analysis/utils/__pycache__/**
+
