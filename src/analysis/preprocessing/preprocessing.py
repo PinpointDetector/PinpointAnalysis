@@ -2,19 +2,11 @@ import argparse
 from pathlib import Path
 
 import awkward as ak
-import hist
-import matplotlib as mpl
-import matplotlib.pyplot as plt
-import mplhep
-import numpy as np
 import pandas as pd
 import uproot
 
 from analysis.utils.geometry import Geometry, get_rebinned_geometry
-from analysis.utils.plot_utils import setup
-from analysis.utils.truth import TruthParticle, get_truth_particle
-from analysis.utils.units import um
-from analysis.utils.utils import get_color_from_pdg, get_label_from_pdg
+from analysis.utils.utils import get_parquet_path, get_root_path
 
 
 def get_rebinned_df(
@@ -44,8 +36,6 @@ def get_rebinned_df(
         "energy": (energy_var, "sum"),
         "n_hits": (energy_var, "count"),
     }
-    # if "fromMuon" in hits_df.columns:
-    #     aggregator_dict["fromMuon"] = ("fromMuon", "any")
 
     resampled = (
         hits_resampled.groupby(["event_id", layer_var, "new_pixel_x", "new_pixel_y"])
@@ -59,7 +49,16 @@ def get_rebinned_df(
     return resampled
 
 
-def create_parquet_from_root(input_path: Path, output_path: Path) -> None:
+def create_parquet_from_root(run: int, chunk: int, recreate: bool = False) -> None:
+    hits_file = get_parquet_path() / f"{run}/{run}_{chunk}_hits.parq"
+    truth_file = get_parquet_path() / f"{run}/{run}_{chunk}_truth.parq"
+    if hits_file.exists() and truth_file.exists() and not recreate:
+        print(f"Hits and truth files already exist in {hits_file.parent}.")
+        return
+
+    input_path = get_root_path() / f"{run}/{run:05d}_{chunk:03d}.root"
+    if not input_path.exists():
+        raise FileNotFoundError(f"Input ROOT file {input_path} does not exist.")
     root_file = uproot.open(input_path)
 
     # truth neutrino
@@ -132,37 +131,59 @@ def create_parquet_from_root(input_path: Path, output_path: Path) -> None:
     )
 
     # write to parquet
-    df.to_parquet(output_path / "hits.parq")
-    truth_df.to_parquet(output_path / "truth.parq")
+    df.to_parquet(hits_file)
+    truth_df.to_parquet(truth_file)
 
 
 def create_rebinned_parquet(
-    input_path: Path, output_path: Path, pixel_size: float
+    run: int, chunk: int, pixel_size: float, recreate: bool = False
 ) -> None:
-    hits_df = pd.read_parquet(input_path / "hits.parq")
+    output_path = (
+        get_parquet_path() / f"{run}/{pixel_size:03d}um_bins/{run}_{chunk}_hits.parq"
+    )
+    if output_path.exists() and not recreate:
+        print(f"Output path {output_path} already exists.")
+        return
+
+    input_path = get_parquet_path() / f"{run}/{run}_{chunk}_hits.parq"
+    if not input_path.exists():
+        raise FileNotFoundError(f"Input parquet file {input_path} does not exist.")
+
+    hits_df = pd.read_parquet(input_path)
 
     geo = Geometry()
     new_geo = get_rebinned_geometry(pixel_size=pixel_size, old_geometry=geo)
     new_df = get_rebinned_df(hits_df=hits_df, old_geometry=geo, new_geometry=new_geo)
-    new_df.to_parquet(output_path / input_path.name)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    new_df.to_parquet(output_path)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "-i",
-        "--input",
-        type=str,
+        "-r",
+        "--run",
+        type=int,
         required=True,
-        help="Path to the input ROOT file.",
     )
     parser.add_argument(
-        "-o",
-        "--output",
-        type=str,
+        "-c",
+        "--chunk",
+        type=int,
         required=True,
-        help="Path to the output Parquet file.",
+    )
+    parser.add_argument(
+        "-p", "--pixel_size", type=float, default=500.0, help="New pixel size."
+    )
+    parser.add_argument(
+        "--recreate", action="store_true", help="Recreate output files."
     )
     args = parser.parse_args()
 
-    create_parquet_from_root(Path(args.input), Path(args.output))
+    create_parquet_from_root(run=args.run, chunk=args.chunk, recreate=args.recreate)
+    create_rebinned_parquet(
+        run=args.run,
+        chunk=args.chunk,
+        pixel_size=args.pixel_size,
+        recreate=args.recreate,
+    )
