@@ -1,4 +1,58 @@
+from pathlib import Path
+
 from analysis.utils.colors import TangoColors
+
+
+def get_project_path() -> Path:
+    """Get path of project directory which contains e.g. pyproject.toml file"""
+    current_path = Path.cwd()
+    while current_path != current_path.parent:
+        if (current_path / "pyproject.toml").is_file():
+            return current_path
+        current_path = current_path.parent
+    raise FileNotFoundError("pyproject.toml not found in the project structure.")
+
+
+def get_data_path() -> Path:
+    data_path = get_project_path() / "../data"
+    data_path.mkdir(exist_ok=True)
+    return data_path
+
+
+def get_root_path() -> Path:
+    root_path = get_data_path() / "root"
+    root_path.mkdir(exist_ok=True)
+    return root_path
+
+
+def get_parquet_path() -> Path:
+    parquet_path = get_data_path() / "parquet"
+    parquet_path.mkdir(exist_ok=True)
+    return parquet_path
+
+
+def get_torch_path() -> Path:
+    torch_path = get_data_path() / "torch"
+    torch_path.mkdir(exist_ok=True)
+    return torch_path
+
+
+def get_npy_path() -> Path:
+    npy_path = get_data_path() / "npy"
+    npy_path.mkdir(exist_ok=True)
+    return npy_path
+
+
+def get_weights_path() -> Path:
+    weights_path = get_data_path() / "weights"
+    weights_path.mkdir(exist_ok=True)
+    return weights_path
+
+
+def get_figures_path() -> Path:
+    figures_path = get_project_path() / "../figures"
+    figures_path.mkdir(exist_ok=True)
+    return figures_path
 
 
 def get_label_from_pdg(pdg: int) -> str:
