@@ -1,4 +1,5 @@
 import argparse
+import logging
 from pathlib import Path
 
 import awkward as ak
@@ -53,7 +54,7 @@ def create_parquet_from_root(run: int, chunk: int, recreate: bool = False) -> No
     hits_file = get_parquet_path() / f"{run}/{run}_{chunk}_hits.parq"
     truth_file = get_parquet_path() / f"{run}/{run}_{chunk}_truth.parq"
     if hits_file.exists() and truth_file.exists() and not recreate:
-        print(f"Hits and truth files already exist in {hits_file.parent}.")
+        logging.info(f"Hits and truth files already exist in {hits_file.parent}.")
         return
 
     input_path = get_root_path() / f"{run}/{run:05d}_{chunk:03d}.root"
@@ -81,7 +82,7 @@ def create_parquet_from_root(run: int, chunk: int, recreate: bool = False) -> No
     primaries_df = root_file["primaries"].arrays(primaries_columns, library="pd")
     primaries_df.query("trackID == 1", inplace=True)
     primaries_df = primaries_df[[i for i in primaries_df.columns if i != "trackID"]]
-    primaries_df.rename(
+    primaries_df = primaries_df.rename(
         columns={
             "evtID": "event_id",
             "E": "E_lepton",
@@ -89,8 +90,7 @@ def create_parquet_from_root(run: int, chunk: int, recreate: bool = False) -> No
             "Px": "px_lepton",
             "Py": "py_lepton",
             "Pz": "pz_lepton",
-        },
-        inplace=True,
+        }
     )
 
     if len(truth_df) != len(primaries_df):
@@ -124,25 +124,24 @@ def create_parquet_from_root(run: int, chunk: int, recreate: bool = False) -> No
     )
 
     # map pixel indices to positions
-    df["x"] = df.apply(lambda row: geom["pixel_Xpos"][0][int(row["hit_colID"])], axis=1)
-    df["y"] = df.apply(lambda row: geom["pixel_Ypos"][0][int(row["hit_rowID"])], axis=1)
-    df["z"] = df.apply(
-        lambda row: geom["pixel_Zpos"][0][int(row["hit_layerID"])], axis=1
-    )
-
+    df.loc[:, "x"] = geom["pixel_Xpos"][0][df["hit_colID"].astype(int).values]
+    df.loc[:, "y"] = geom["pixel_Ypos"][0][df["hit_rowID"].astype(int).values]
+    df.loc[:, "z"] = geom["pixel_Zpos"][0][df["hit_layerID"].astype(int).values]
     # write to parquet
+    (get_parquet_path() / f"{run}").mkdir(parents=True, exist_ok=True)
     df.to_parquet(hits_file)
     truth_df.to_parquet(truth_file)
+    logging.info(f"Created hits file {hits_file} and truth file {truth_file}.")
 
 
 def create_rebinned_parquet(
     run: int, chunk: int, pixel_size: float, recreate: bool = False
 ) -> None:
     output_path = (
-        get_parquet_path() / f"{run}/{pixel_size:03d}um_bins/{run}_{chunk}_hits.parq"
+        get_parquet_path() / f"{run}/{pixel_size:03.0f}um_bins/{run}_{chunk}_hits.parq"
     )
     if output_path.exists() and not recreate:
-        print(f"Output path {output_path} already exists.")
+        logging.info(f"Output path {output_path} already exists.")
         return
 
     input_path = get_parquet_path() / f"{run}/{run}_{chunk}_hits.parq"
@@ -156,6 +155,7 @@ def create_rebinned_parquet(
     new_df = get_rebinned_df(hits_df=hits_df, old_geometry=geo, new_geometry=new_geo)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     new_df.to_parquet(output_path)
+    logging.info(f"Created rebinned hits file {output_path}.")
 
 
 if __name__ == "__main__":
@@ -178,7 +178,17 @@ if __name__ == "__main__":
     parser.add_argument(
         "--recreate", action="store_true", help="Recreate output files."
     )
+    parser.add_argument(
+        "-l",
+        "--log-level",
+        type=str,
+        default="INFO",
+        choices=["info", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="Set the logging level (default: INFO).",
+    )
     args = parser.parse_args()
+
+    logging.basicConfig(level=getattr(logging, args.log_level))
 
     create_parquet_from_root(run=args.run, chunk=args.chunk, recreate=args.recreate)
     create_rebinned_parquet(
