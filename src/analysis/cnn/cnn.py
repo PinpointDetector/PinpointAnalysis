@@ -7,7 +7,7 @@ from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader
 
 from analysis.utils.datasets import CNN3DDataset, CNNProjectionDataset
-from analysis.utils.networks import ClassifierProjectionCNN
+from analysis.utils.models import ClassifierProjectionCNN
 from analysis.utils.torch_data_utils import evaluate_model
 from analysis.utils.torch_utils import get_device, show_model, train
 from analysis.utils.utils import get_figures_path, get_torch_path, get_weights_path
