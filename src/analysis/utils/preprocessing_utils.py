@@ -2,18 +2,19 @@ import logging
 from pathlib import Path
 
 import awkward as ak
+import numpy as np
 import pandas as pd
 import uproot
 
 from analysis.utils.geometry import Geometry, get_geometry, get_rebinned_geometry
-from analysis.utils.units import mm
+from analysis.utils.units import um
 from analysis.utils.utils import get_parquet_path, get_root_path
 
 
 def create_parquet_from_root(
     run: int, chunk: int, input_path: Path | None = None, recreate: bool = False
 ) -> None:
-    run_path = get_root_path() / f"{run:05d}"
+    run_path = get_parquet_path() / f"{run:05d}"
     hits_file = run_path / f"{run:05d}_{chunk:03d}_hits.parq"
     truth_file = run_path / f"{run:05d}_{chunk:03d}_truth.parq"
     geo_path = run_path / "geometry.pkl"
@@ -131,17 +132,20 @@ def get_rebinned_df(
     hits_resampled.loc[:, "new_pixel_y"] = (
         hits_df[pixel_y_var].values // y_bin_factor
     ).astype(int)
-    hits_resampled["from_muon"] = 0
-    hits_resampled.loc[hits_resampled["hit_pdgc"].abs() == 13, "from_muon"] = 1
 
-    hits_resampled["from_electron"] = 0
-    hits_resampled.loc[hits_resampled["hit_pdgc"].abs() == 11, "from_electron"] = 1
+    queries = [
+        "(abs(hit_pdgc) != 11) & (abs(hit_pdgc) != 13)",
+        "(abs(hit_pdgc) == 11) & (hit_fromPrimaryEMShower == 0)",
+        "(abs(hit_pdgc) == 11) & (hit_fromPrimaryEMShower == 1)",
+        "(abs(hit_pdgc) == 13)",
+    ]
+    for label, query in enumerate(queries):
+        hits_resampled.loc[hits_resampled.eval(query), "pdg_label"] = label
 
     aggregator_dict = {
         "energy": (energy_var, "sum"),
         "n_hits": (energy_var, "count"),
-        "from_muon": ("from_muon", "any"),
-        "from_electron": ("from_electron", "any"),
+        "pdg_label": ("pdg_label", "max"),
     }
 
     resampled = (
@@ -150,16 +154,16 @@ def get_rebinned_df(
         .reset_index()
     )
 
-    resampled["hit_label"] = 0
-    resampled.loc[resampled["from_muon"] == 1, "hit_label"] = 1
-    resampled.loc[resampled["from_electron"] == 1, "hit_label"] = 2
+    # resampled["hit_label"] = 0
+    # resampled.loc[resampled["from_muon"] == 1, "hit_label"] = 1
+    # resampled.loc[resampled["from_electron"] == 1, "hit_label"] = 2
 
     resampled.rename(
         columns={"new_pixel_x": "pixel_x", "new_pixel_y": "pixel_y"}, inplace=True
     )
 
     # If there are n pixels, sometimes we get index n, which is out of bounds
-    resampled = resampled.loc[
+    resampled = resampled[
         (resampled["pixel_x"] < new_geometry.num_x_pixels)
         & (resampled["pixel_y"] < new_geometry.num_y_pixels)
     ]
@@ -179,28 +183,41 @@ def create_rebinned_parquet_file(
     run: int, chunk: int, pixel_size: float, recreate: bool = False
 ) -> None:
     """
-    pixel_size: in mm
+    pixel_size: in um
     """
-    output_path = get_parquet_path() / f"{run}/muon_{pixel_size:03.0f}um_bins"
-    output_hits_file = output_path / f"{run}_{chunk}_hits.parq"
-    output_truth_file = output_path / f"{run}_{chunk}_truth.parq"
+    output_path = get_parquet_path() / f"{run}/{pixel_size:03.0f}um_bins"
+    output_hits_file = output_path / f"{run}_{chunk:03d}_hits.parq"
+    output_truth_file = output_path / f"{run}_{chunk:03d}_truth.parq"
+    output_geometry_file = output_path / "geometry.pkl"
 
     if output_hits_file.exists() and not recreate:
         logging.info(f"Output path {output_path} already exists.")
         return
 
     input_geo_file = get_parquet_path() / f"{run}/geometry.pkl"
-    input_hits_file = get_parquet_path() / f"{run}/{run}_{chunk}_hits.parq"
-    input_truth_file = get_parquet_path() / f"{run}/{run}_{chunk}_truth.parq"
+    input_hits_file = get_parquet_path() / f"{run}/{run}_{chunk:03d}_hits.parq"
+    input_truth_file = get_parquet_path() / f"{run}/{run}_{chunk:03d}_truth.parq"
 
     if not input_hits_file.exists():
         raise FileNotFoundError(f"Input parquet file {input_hits_file} does not exist.")
     hits_df = pd.read_parquet(input_hits_file)
 
     geo = get_geometry(geo_path=input_geo_file)
-    new_geo = get_rebinned_geometry(pixel_size=pixel_size * mm, old_geometry=geo)
+    new_geo = get_rebinned_geometry(
+        pixel_size=pixel_size * um, old_geometry=geo, geometry_path=output_geometry_file
+    )
     new_df = get_rebinned_df(hits_df=hits_df, old_geometry=geo, new_geometry=new_geo)
     output_path.mkdir(parents=True, exist_ok=True)
     new_df.to_parquet(output_hits_file)
     output_truth_file.symlink_to(input_truth_file)
     logging.info(f"Created rebinned hits file {output_hits_file}.")
+
+
+def get_good_event_ids(df: pd.DataFrame):
+    # Require distance of 10 mm from detector edge, so that shower is (fully) contained
+    geo = Geometry()
+    df = df.query(f"(vx.abs() < {geo.xmax} - 10) & (vy.abs() < {geo.ymax} - 10)")
+
+    # Take only events in the fiducial volume
+    # df = df.query("vx**2 + vy**2 < 100**2")
+    return df["event_id"].values
