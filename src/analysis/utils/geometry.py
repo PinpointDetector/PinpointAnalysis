@@ -1,4 +1,4 @@
-from copyreg import pickle
+import pickle
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -180,34 +180,55 @@ class Geometry:
         return int(pos / self.pixel_y_size + self.num_y_pixels // 2)
 
 
-def get_rebinned_geometry(pixel_size: float, old_geometry: Geometry) -> Geometry:
-    return Geometry(
-        pixel_x_size=pixel_size,
-        pixel_y_size=pixel_size,
-        num_x_pixels=int(
-            old_geometry.num_x_pixels * old_geometry.pixel_x_size / pixel_size
-        ),
-        num_y_pixels=int(
-            old_geometry.num_y_pixels * old_geometry.pixel_y_size / pixel_size
-        ),
-        num_layers=old_geometry.num_layers,
-        tungsten_thickness=old_geometry.tungsten_thickness,
-        silicon_thickness=old_geometry.silicon_thickness,
-        box_thickness=old_geometry.box_thickness,
-        scintillator_thickness=old_geometry.scintillator_thickness,
-        num_scintillators=old_geometry.num_scintillators,
-        _layer_thickness=old_geometry.layer_thickness,
-        z_offset=old_geometry.z_offset,
-        _pixel_zpos=old_geometry._pixel_zpos,
-    )
+def get_rebinned_geometry(
+    pixel_size: float,
+    old_geometry: Geometry,
+    geometry_path: str | Path | None = None,
+) -> Geometry:
+    if geometry_path is not None:
+        geometry_path = Path(geometry_path)
+    if geometry_path is not None and geometry_path.exists():
+        with open(geometry_path, "rb") as f:
+            geo = pickle.load(f)
+    else:
+        geo = Geometry(
+            pixel_x_size=pixel_size,
+            pixel_y_size=pixel_size,
+            num_x_pixels=int(
+                old_geometry.num_x_pixels * old_geometry.pixel_x_size / pixel_size
+            ),
+            num_y_pixels=int(
+                old_geometry.num_y_pixels * old_geometry.pixel_y_size / pixel_size
+            ),
+            num_layers=old_geometry.num_layers,
+            tungsten_thickness=old_geometry.tungsten_thickness,
+            silicon_thickness=old_geometry.silicon_thickness,
+            box_thickness=old_geometry.box_thickness,
+            scintillator_thickness=old_geometry.scintillator_thickness,
+            num_scintillators=old_geometry.num_scintillators,
+            _layer_thickness=old_geometry.layer_thickness,
+            z_offset=old_geometry.z_offset,
+            _pixel_zpos=old_geometry._pixel_zpos,
+        )
+        if geometry_path is not None:
+            geometry_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(geometry_path, "wb") as f:
+                pickle.dump(geo, f)
+    return geo
 
 
-def get_geometry(geo_path: str | Path, root_path: str | Path | None = None) -> Geometry:
-    if geo_path.exists():
+def get_geometry(
+    geo_path: str | Path, root_path: str | Path | None = None, recreate: bool = False
+) -> Geometry:
+    geo_path = Path(geo_path)
+    if root_path is not None:
+        root_path = Path(root_path)
+
+    if geo_path.exists() and not recreate:
         with open(geo_path, "rb") as f:
             geo = pickle.load(f)
     else:
-        if root_path is None or not Path(root_path).is_file():
+        if root_path is None or not root_path.is_file():
             raise ValueError(
                 f"Root path {root_path} was not provided or does not exist."
             )
@@ -241,6 +262,7 @@ def get_geometry(geo_path: str | Path, root_path: str | Path | None = None) -> G
             _pixel_ypos=ypos,
             _pixel_zpos=zpos,
         )
+        geo_path.parent.mkdir(parents=True, exist_ok=True)
         with open(geo_path, "wb") as f:
             pickle.dump(geo, f)
     return geo
