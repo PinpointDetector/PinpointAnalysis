@@ -11,16 +11,52 @@ from analysis.utils.units import um
 from analysis.utils.utils import get_parquet_path, get_root_path
 
 
+def extrapolate_hits(df: pd.DataFrame, z_target: float) -> pd.DataFrame:
+    df = df.copy()
+
+    z_cols = ["z_0", "z_1", "z_2"]
+    x_cols = ["x_0", "x_1", "x_2"]
+    y_cols = ["y_0", "y_1", "y_2"]
+
+    x_targets = []
+    y_targets = []
+    for idx, row in df.iterrows():
+        if (
+            (row["hit_counts_0"] > 0)
+            & (row["hit_counts_1"] > 0)
+            & (row["hit_counts_2"] > 0)
+        ):
+            z_pos = row[z_cols].values
+            x_pos = row[x_cols].values
+            y_pos = row[y_cols].values
+
+            x_fit = np.polyfit(z_pos, x_pos, deg=2)  # Quadratic fit for x
+            y_fit = np.polyfit(z_pos, y_pos, deg=1)  # Linear fit for y
+
+            x_targets.append(np.polyval(x_fit, z_target))
+            y_targets.append(np.polyval(y_fit, z_target))
+        else:
+            x_targets.append(0)
+            y_targets.append(0)
+
+    df["xp"] = x_targets
+    df["yp"] = y_targets
+
+    return df
+
+
 def create_parquet_from_root(
     run: int, chunk: int, input_path: Path | None = None, recreate: bool = False
 ) -> None:
     run_path = get_parquet_path() / f"{run:05d}"
     hits_file = run_path / f"{run:05d}_{chunk:03d}_hits.parq"
     truth_file = run_path / f"{run:05d}_{chunk:03d}_truth.parq"
+    faser_file = run_path / f"{run:05d}_{chunk:03d}_faser.parq"
     geo_path = run_path / "geometry.pkl"
     if (
         hits_file.exists()
         and truth_file.exists()
+        and faser_file.exists()
         and geo_path.exists()
         and not recreate
     ):
@@ -103,10 +139,63 @@ def create_parquet_from_root(
     df.loc[:, "x"] = geom["pixel_Xpos"][0][df["hit_colID"].astype(int).values]
     df.loc[:, "y"] = geom["pixel_Ypos"][0][df["hit_rowID"].astype(int).values]
     df.loc[:, "z"] = geom["pixel_Zpos"][0][df["hit_layerID"].astype(int).values]
+
+    # FASER positions in each spectrometer layer
+    faser_pos_columns = ["event_id", "trackerID", "energy", "x", "y", "z", "pz"]
+    faser_pos_df = ak.to_dataframe(
+        root_file["Hits/faserHits"].arrays(faser_pos_columns, library="ak"),
+        how="outer",
+    )
+    faser_pos_df.sort_values(
+        ["event_id", "trackerID", "energy"], ascending=[True, True, False], inplace=True
+    )
+
+    # Number of hits per layer
+    faser_nhits_df = (
+        faser_pos_df.query("energy > 10e3").groupby(["event_id", "trackerID"]).size()
+    )
+    faser_nhits_df = pd.DataFrame(faser_nhits_df, columns=["hit_counts"]).reset_index()
+    faser_nhits_event_df = faser_nhits_df.pivot(
+        index="event_id", columns="trackerID", values=["hit_counts"]
+    )
+    faser_nhits_event_df.columns = [
+        f"{col}_{int(tracker)}" for col, tracker in faser_nhits_event_df.columns
+    ]
+
+    # Take hit with highest energy in each layer per event
+    faser_pos_df = faser_pos_df[
+        ~faser_pos_df.duplicated(subset=["event_id", "trackerID"], keep="first")
+    ]
+    faser_pos_df = faser_pos_df.fillna({"trackerID": 0})
+    # Create dataframe with one row per event and columns for each tracker layer's position
+    faser_pos_event_df = (
+        faser_pos_df.query("~trackerID.isna()")
+        .reset_index()
+        .pivot(
+            index="event_id",
+            columns="trackerID",
+            values=["x", "y", "z", "pz"],
+        )
+    )
+    faser_pos_event_df.columns = [
+        f"{col}_{int(tracker)}" for col, tracker in faser_pos_event_df.columns
+    ]
+    faser_pos_event_df = faser_pos_event_df.reset_index()
+
+    faser_df = pd.merge(
+        faser_pos_event_df,
+        faser_nhits_event_df.reset_index(),
+        on="event_id",
+        how="left",
+    )
+    faser_df.fillna(0, inplace=True)
+    faser_df = extrapolate_hits(faser_df, z_target=750)
+
     # write to parquet
     (get_parquet_path() / f"{run}").mkdir(parents=True, exist_ok=True)
     df.to_parquet(hits_file)
     truth_df.to_parquet(truth_file)
+    faser_df.to_parquet(faser_file)
     logging.info(f"Created hits file {hits_file} and truth file {truth_file}.")
 
 
@@ -213,9 +302,10 @@ def create_rebinned_parquet_file(
     logging.info(f"Created rebinned hits file {output_hits_file}.")
 
 
-def get_good_event_ids(df: pd.DataFrame):
+def get_good_event_ids(df: pd.DataFrame, geo: Geometry | None = None) -> np.ndarray:
     # Require distance of 10 mm from detector edge, so that shower is (fully) contained
-    geo = Geometry()
+    if geo is None:
+        geo = Geometry()
     df = df.query(f"(vx.abs() < {geo.xmax} - 10) & (vy.abs() < {geo.ymax} - 10)")
 
     # Take only events in the fiducial volume
