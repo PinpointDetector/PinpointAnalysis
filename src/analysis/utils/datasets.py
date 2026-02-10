@@ -243,3 +243,86 @@ class CNNProjectionDataset(Dataset):
         }
 
         return (zx_tensor, zy_tensor), targets
+
+
+class CNNProjectionDatasetFaser(Dataset):
+    """Dataset that stores binned pixel counts per event"""
+
+    def __init__(
+        self,
+        data_list: list[tuple[pd.DataFrame, pd.DataFrame, int]],
+        bins: tuple[int, int, int],
+        geo: Geometry,
+    ):
+        self.projections = []
+        self.labels = []
+        self.e_nu = []
+        self.e_lepton = []
+        self.vx = []
+        self.vy = []
+        self.delta_vx = []
+        self.delta_vy = []
+
+        for hits_df, faser_df, truth_df, label in data_list:
+            event_ids = hits_df["event_id"].unique()
+            logging.info(f"Processing {len(event_ids)} events")
+
+            for event_id in event_ids:
+                event_hits = hits_df.loc[hits_df["event_id"] == event_id]
+                event_truth = truth_df[truth_df["event_id"] == event_id].iloc[0]
+
+                mean_x, mean_y, zx_proj, zy_proj = create_projections(event_hits, bins)
+                if (
+                    mean_x is None
+                    or mean_y is None
+                    or zx_proj is None
+                    or zy_proj is None
+                ):
+                    # FIXME: Because of this the truth dataframe has more entries
+                    continue
+
+                x_faser = faser_df[["nhits_0", "nhits_1", "nhits_2"]].values[0]
+                # x_faser[3] = x_faser[3] - mean_x
+                # x_faser[4] = x_faser[4] - mean_y
+                x_faser = torch.tensor(x_faser, dtype=torch.float)
+
+                zx_tensor = torch.FloatTensor(zx_proj).unsqueeze(0)
+                # zx_tensor = torch.log(zx_tensor + 1)
+
+                zy_tensor = torch.FloatTensor(zy_proj).unsqueeze(0)
+                # zy_tensor = torch.log(zy_tensor + 1)
+
+                self.projections.append((zx_tensor, zy_tensor, x_faser))
+
+                # truth variables
+                self.labels.append(label)
+                self.e_nu.append(np.float32(event_truth["E_nu"]))
+                self.e_lepton.append(np.float32(event_truth["E_lepton"]))
+
+                vx = np.float32(event_truth["vx"])
+                vy = np.float32(event_truth["vy"])
+                mean_x_pos = geo.get_x_pos(mean_x)
+                mean_y_pos = geo.get_y_pos(mean_y)
+                self.vx.append(vx)
+                self.vy.append(vy)
+                self.delta_vx.append(mean_x_pos - vx)
+                self.delta_vy.append(mean_y_pos - vy)
+
+        logging.info(f"Created dataset with {len(self.projections)} samples")
+
+    def __len__(self):
+        return len(self.projections)
+
+    def __getitem__(self, idx):
+        zx_tensor, zy_tensor, x_faser = self.projections[idx]
+        targets = {
+            "label": self.labels[idx],
+            "E_nu": np.float32(self.e_nu[idx]),
+            "E_lepton": np.float32(self.e_lepton[idx]),
+            "delta_vx": np.float32(self.delta_vx[idx]),
+            "delta_vy": np.float32(self.delta_vy[idx]),
+            "vx": np.float32(self.vx[idx]),
+            "vy": np.float32(self.vy[idx]),
+        }
+
+        return (zx_tensor, zy_tensor, x_faser), targets

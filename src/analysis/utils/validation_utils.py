@@ -49,13 +49,16 @@ def plot_confusion_matrix(
     figure_path: str | Path | None = None,
     vmin: float = 0.0,
     vmax: float = 1.0,
+    cbar_label: str | None = None,
+    title: str | None = None,
 ) -> None:
     cm = confusion_matrix(y_true, y_pred)
     cm_counts = cm.copy()  # Keep original counts
 
     if normalize:
         cm_normalized = cm.astype("float") / cm.sum(axis=1, keepdims=True)
-        cbar_kws = {"label": "Norm. Number of Events"}
+    if cbar_label is not None:
+        cbar_kws = {"label": cbar_label}
     else:
         cbar_kws = {"label": "Number of Events"}
 
@@ -93,6 +96,8 @@ def plot_confusion_matrix(
     ax.set_xlabel("Predicted")
     ax.set_ylabel("True")
     ax.set_aspect("equal")
+    if title is not None:
+        ax.set_title(title)
     plt.tight_layout()
     if figure_path is not None:
         plt.savefig(figure_path)
@@ -104,6 +109,7 @@ def plot_roc_curve(
     y_prob: np.ndarray,
     class_names: list[str],
     figure_path: str | Path | None = None,
+    title: str | None = None,
 ):
     """Multi-class ROC Curves (One-vs-Rest)"""
     if len(class_names) == 2:
@@ -128,6 +134,8 @@ def plot_roc_curve(
     ax.set_ylabel("True Positive Rate")
     ax.set_title("")
     ax.legend()
+    if title is not None:
+        ax.set_title(title)
     plt.tight_layout()
     # if figure_path is not None:
     #     plt.savefig(figure_path)
@@ -138,6 +146,7 @@ def plot_precision_recall_curve(
     y_true: np.ndarray,
     y_prob: np.ndarray,
     class_names: list[str],
+    title: str | None = None,
     figure_path: str | Path | None = None,
 ):
     """
@@ -158,6 +167,8 @@ def plot_precision_recall_curve(
     ax.set_xlabel("Recall")
     ax.set_ylabel("Precision")
     ax.legend()
+    if title is not None:
+        ax.set_title(title)
     plt.tight_layout()
     if figure_path is not None:
         plt.savefig(figure_path)

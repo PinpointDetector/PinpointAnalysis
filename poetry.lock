@@ -1349,6 +1349,23 @@ test-full = ["adlfs", "aiohttp (!=4.0.0a0,!=4.0.0a1)", "backports-zstd ; python_
 tqdm = ["tqdm"]
 
 [[package]]
+name = "hepunits"
+version = "2.4.4"
+description = "Units and constants in the HEP system of units"
+optional = false
+python-versions = ">=3.9"
+groups = ["main"]
+files = [
+    {file = "hepunits-2.4.4-py3-none-any.whl", hash = "sha256:54c4458576daffa2a134b0344015a76d42b4441c353fe544967bef1907ea8143"},
+    {file = "hepunits-2.4.4.tar.gz", hash = "sha256:1846e729fa3e4fb36bff599ed7b8bd2cdc4abdc02906830fb75c205fd54905eb"},
+]
+
+[package.extras]
+all = ["pint (<0.25.1)", "pytest (>=6)", "pytest-cov (>=2.8.0)"]
+dev = ["pint (<0.25.1)", "pytest (>=6)", "pytest-cov (>=2.8.0)"]
+test = ["pint (<0.25.1)", "pytest (>=6)", "pytest-cov (>=2.8.0)"]
+
+[[package]]
 name = "hist"
 version = "2.9.2"
 description = "Hist classes and utilities"
@@ -2548,6 +2565,28 @@ files = [
 [package.extras]
 qa = ["flake8 (==5.0.4)", "mypy (==0.971)", "types-setuptools (==67.2.0.1)"]
 testing = ["docopt", "pytest"]
+
+[[package]]
+name = "particle"
+version = "0.26.1"
+description = "Extended PDG particle data and MC identification codes"
+optional = false
+python-versions = ">=3.9"
+groups = ["main"]
+files = [
+    {file = "particle-0.26.1-py3-none-any.whl", hash = "sha256:a1110b2488d87a1125547cac6db948dee4ffaa3f7ccc01cb735813e36a649427"},
+    {file = "particle-0.26.1.tar.gz", hash = "sha256:107698d0ad8d56d6568ef97367f424e5d672a14087a5de31539d6218257590c7"},
+]
+
+[package.dependencies]
+attrs = ">=22.2.0"
+hepunits = ">=2.4.0"
+typing-extensions = {version = ">=4.5", markers = "python_version < \"3.13\""}
+
+[package.extras]
+all = ["pandas", "pre-commit", "pytest (>=6)", "pytest-benchmark", "pytest-cov", "tabulate"]
+dev = ["pandas", "pre-commit", "pytest (>=6)", "pytest-benchmark", "tabulate"]
+test = ["pandas", "pytest (>=6)", "pytest-benchmark", "pytest-cov", "tabulate"]
 
 [[package]]
 name = "pexpect"
@@ -3900,4 +3939,4 @@ propcache = ">=0.2.1"
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.12,<3.13"
-content-hash = "9a23c5704f448fcae2b366f41158a9af24be91dd923d3b86ec4e2072dc968c21"
+content-hash = "980be3125232ced34cd3e85e496121fc9408e63052733fd4eddccda96d2fec9b"

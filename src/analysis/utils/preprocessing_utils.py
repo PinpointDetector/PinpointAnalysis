@@ -52,11 +52,13 @@ def create_parquet_from_root(
     hits_file = run_path / f"{run:05d}_{chunk:03d}_hits.parq"
     truth_file = run_path / f"{run:05d}_{chunk:03d}_truth.parq"
     faser_file = run_path / f"{run:05d}_{chunk:03d}_faser.parq"
+    primaries_file = run_path / f"{run:05d}_{chunk:03d}_primaries.parq"
     geo_path = run_path / "geometry.pkl"
     if (
         hits_file.exists()
         and truth_file.exists()
         and faser_file.exists()
+        and primaries_file.exists()
         and geo_path.exists()
         and not recreate
     ):
@@ -90,9 +92,21 @@ def create_parquet_from_root(
     # truth lepton
     primaries_columns = ["evtID", "trackID", "PDG", "E", "Px", "Py", "Pz"]
     primaries_df = root_file["primaries"].arrays(primaries_columns, library="pd")
-    primaries_df.query("trackID == 1", inplace=True)
-    primaries_df = primaries_df[[i for i in primaries_df.columns if i != "trackID"]]
-    primaries_df = primaries_df.rename(
+
+    # Get events which contain a charmed hadron (nu -> X + c)
+    charm_pdg_ids = [421, 421, 431, 4122, 4112, 4212, 4222, 4132, 4232]
+    charm_event_ids = primaries_df.loc[primaries_df["PDG"].abs().isin(charm_pdg_ids)][
+        "evtID"
+    ].unique()
+    truth_df["charm"] = 0
+    truth_df.loc[truth_df["event_id"].isin(charm_event_ids), "charm"] = 1
+
+    primary_lepton_df = primaries_df.query("trackID == 1")
+    # remove trackID column
+    primary_lepton_df = primary_lepton_df[
+        [i for i in primary_lepton_df.columns if i != "trackID"]
+    ]
+    primary_lepton_df = primary_lepton_df.rename(
         columns={
             "evtID": "event_id",
             "E": "E_lepton",
@@ -103,10 +117,12 @@ def create_parquet_from_root(
         }
     )
 
-    if len(truth_df) != len(primaries_df):
+    if len(truth_df) != len(primary_lepton_df):
         raise ValueError("Dataframes should have same length!")
 
-    truth_df = pd.merge(truth_df, primaries_df, left_on="event_id", right_on="event_id")
+    truth_df = pd.merge(
+        truth_df, primary_lepton_df, left_on="event_id", right_on="event_id"
+    )
 
     # geometry
     geom_columns = ["pixel_Xpos", "pixel_Ypos", "pixel_Zpos"]
@@ -122,6 +138,7 @@ def create_parquet_from_root(
         "hit_edep",
         "hit_fromPrimaryLepton",
         "hit_fromPrimaryEMShower",
+        "hit_fromCharmedHadron",
     ]
     df: pd.DataFrame = ak.to_dataframe(
         root_file["Hits/pixelHits"].arrays(columns, library="ak"),
@@ -190,12 +207,38 @@ def create_parquet_from_root(
     )
     faser_df.fillna(0, inplace=True)
     faser_df = extrapolate_hits(faser_df, z_target=750)
+    faser_df.rename(
+        {
+            "hit_counts_0": "nhits_0",
+            "hit_counts_1": "nhits_1",
+            "hit_counts_2": "nhits_2",
+            "xp": "faser_x",
+            "yp": "faser_y",
+        },
+        axis=1,
+        inplace=True,
+    )
+
+    # primaries (for easier access later)
+    # primaries_columns = ["evtID", "trackID", "PDG", "E", "Px", "Py", "Pz"]
+    # primaries_df = root_file["primaries"].arrays(primaries_columns, library="pd")
+    primaries_df = primaries_df.rename(
+        columns={
+            "evtID": "event_id",
+            "E": "E",
+            "PDG": "pdg",
+            "Px": "px",
+            "Py": "py",
+            "Pz": "pz",
+        }
+    )
 
     # write to parquet
     (get_parquet_path() / f"{run}").mkdir(parents=True, exist_ok=True)
     df.to_parquet(hits_file)
     truth_df.to_parquet(truth_file)
     faser_df.to_parquet(faser_file)
+    primaries_df.to_parquet(primaries_file)
     logging.info(f"Created hits file {hits_file} and truth file {truth_file}.")
 
 
@@ -277,6 +320,7 @@ def create_rebinned_parquet_file(
     output_path = get_parquet_path() / f"{run}/{pixel_size:03.0f}um_bins"
     output_hits_file = output_path / f"{run}_{chunk:03d}_hits.parq"
     output_truth_file = output_path / f"{run}_{chunk:03d}_truth.parq"
+    output_faser_file = output_path / f"{run}_{chunk:03d}_faser.parq"
     output_geometry_file = output_path / "geometry.pkl"
 
     if output_hits_file.exists() and not recreate:
@@ -286,6 +330,7 @@ def create_rebinned_parquet_file(
     input_geo_file = get_parquet_path() / f"{run}/geometry.pkl"
     input_hits_file = get_parquet_path() / f"{run}/{run}_{chunk:03d}_hits.parq"
     input_truth_file = get_parquet_path() / f"{run}/{run}_{chunk:03d}_truth.parq"
+    input_faser_file = get_parquet_path() / f"{run}/{run}_{chunk:03d}_faser.parq"
 
     if not input_hits_file.exists():
         raise FileNotFoundError(f"Input parquet file {input_hits_file} does not exist.")
@@ -299,15 +344,33 @@ def create_rebinned_parquet_file(
     output_path.mkdir(parents=True, exist_ok=True)
     new_df.to_parquet(output_hits_file)
     output_truth_file.symlink_to(input_truth_file)
+    output_faser_file.symlink_to(input_faser_file)
     logging.info(f"Created rebinned hits file {output_hits_file}.")
 
 
-def get_good_event_ids(df: pd.DataFrame, geo: Geometry | None = None) -> np.ndarray:
+def get_good_event_ids(
+    df: pd.DataFrame, geo: Geometry | None = None, apply_truth_cuts: bool = False
+) -> np.ndarray:
     # Require distance of 10 mm from detector edge, so that shower is (fully) contained
-    if geo is None:
-        geo = Geometry()
-    df = df.query(f"(vx.abs() < {geo.xmax} - 10) & (vy.abs() < {geo.ymax} - 10)")
+    # if geo is None:
+    #     geo = Geometry()
+    # df = df.query(f"(vx.abs() < {geo.xmax} - 20) & (vy.abs() < {geo.ymax} - 20)")
 
     # Take only events in the fiducial volume
     # df = df.query("vx**2 + vy**2 < 100**2")
+
+    if apply_truth_cuts:
+        df.loc[:, "E_ratio"] = df["E_lepton"] / df["E_nu"]
+        df.loc[:, "tan_theta_lepton"] = (
+            np.sqrt(df["px_lepton"].values ** 2 + df["py_lepton"].values ** 2)
+            / df["pz_lepton"].values
+        )
+        df = df.query(
+            "(E_ratio > 0.2) & (tan_theta_lepton < 0.025) & (vx**2 + vy**2 < 100**2)"
+        )
+    else:
+        if geo is None:
+            geo = Geometry()
+        df = df.query(f"(vx.abs() < {geo.xmax} - 20) & (vy.abs() < {geo.ymax} - 20)")
+
     return df["event_id"].values
