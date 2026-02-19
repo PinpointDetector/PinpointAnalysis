@@ -138,8 +138,11 @@ def create_parquet_from_root(
         "hit_edep",
         "hit_fromPrimaryLepton",
         "hit_fromPrimaryEMShower",
-        "hit_fromCharmedHadron",
     ]
+    # Only request hit_fromCharmedHadron if the ROOT file has it
+    available_keys = root_file["Hits/pixelHits"].keys()
+    if "hit_fromCharmedHadron" in available_keys:
+        columns.append("hit_fromCharmedHadron")
     df: pd.DataFrame = ak.to_dataframe(
         root_file["Hits/pixelHits"].arrays(columns, library="ak"),
         how="outer",
