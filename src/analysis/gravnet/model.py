@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GravNetConv, global_mean_pool
+from torch_geometric.nn import GravNetConv, global_add_pool, global_mean_pool
 
 
 class NeutrinoGravNet(nn.Module):
@@ -1227,3 +1227,193 @@ class NeutrinoGravNetNodesFaser(nn.Module):
         node_out = self.node_classifier(x_node_combined)
 
         return node_out
+
+
+class NeutrinoGravNetRegressionFASER(nn.Module):
+    """
+    GravNet model for energy regression with FASER spectrometer data.
+    Based on NeutrinoGravNetFASER but with a regression head instead of classification.
+
+    Predicts continuous energy targets (E_nu, E_lepton, E_roe) per event.
+
+    Architecture:
+    - GlobalExchange: append global mean to each node
+    - 3 GravNet blocks with feature transformation MLPs
+    - Global pooling (mean or sum) to get graph-level representation
+    - FASER feature processing MLP
+    - Regression head (no final activation)
+    """
+
+    def __init__(
+        self,
+        input_dim: int = 1,
+        num_targets: int = 3,
+        faser_dim: int = 5,
+        pooling: str = "mean",
+        dropout: float = 0.2,
+        n_feature_transform: int = 16,
+        out_channels: int = 16,
+        space_dimensions: int = 3,
+        propagate_dimensions: int = 16,
+        k: int = 12,
+        n_gravstack: int = 3,
+        batchnorm_momentum: float = 0.05,
+    ):
+        """
+        Args:
+            input_dim: Input feature dimension (e.g., energy only)
+            num_targets: Number of regression targets (default: 3 for E_nu, E_lepton, E_roe)
+            faser_dim: Dimension of FASER spectrometer features
+            pooling: Pooling method for graph-level features ("mean" or "sum")
+            dropout: Dropout probability
+            n_feature_transform: Hidden dimension for feature transformation MLPs
+            out_channels: Output channels from each GravNet block
+            space_dimensions: Dimensionality of learned spatial representation (S)
+            propagate_dimensions: Dimensionality of features to propagate (F_LR)
+            k: Number of nearest neighbors for aggregation
+            n_gravstack: Number of GravNet blocks
+            batchnorm_momentum: BatchNorm momentum
+        """
+        super().__init__()
+
+        # Input will be [features, x, y, z] concatenated
+        input_with_pos = input_dim + 3
+
+        # After GlobalExchange, input doubles (original + global mean)
+        initial_features = input_with_pos * 2
+
+        # GravNet stack 1
+        self.ft1_1 = nn.Linear(initial_features, n_feature_transform)
+        self.ft1_2 = nn.Linear(n_feature_transform, n_feature_transform)
+        self.ft1_3 = nn.Linear(n_feature_transform, n_feature_transform)
+        self.gn1 = GravNetConv(
+            in_channels=n_feature_transform,
+            out_channels=out_channels,
+            space_dimensions=space_dimensions,
+            propagate_dimensions=propagate_dimensions,
+            k=k,
+        )
+        self.bn1 = nn.BatchNorm1d(out_channels, momentum=batchnorm_momentum)
+
+        # GravNet stack 2
+        self.ft2_1 = nn.Linear(out_channels, n_feature_transform)
+        self.ft2_2 = nn.Linear(n_feature_transform, n_feature_transform)
+        self.ft2_3 = nn.Linear(n_feature_transform, n_feature_transform)
+        self.gn2 = GravNetConv(
+            in_channels=n_feature_transform,
+            out_channels=out_channels,
+            space_dimensions=space_dimensions,
+            propagate_dimensions=propagate_dimensions,
+            k=k,
+        )
+        self.bn2 = nn.BatchNorm1d(out_channels, momentum=batchnorm_momentum)
+
+        # GravNet stack 3
+        self.ft3_1 = nn.Linear(out_channels, n_feature_transform)
+        self.ft3_2 = nn.Linear(n_feature_transform, n_feature_transform)
+        self.ft3_3 = nn.Linear(n_feature_transform, n_feature_transform)
+        self.gn3 = GravNetConv(
+            in_channels=n_feature_transform,
+            out_channels=out_channels,
+            space_dimensions=space_dimensions,
+            propagate_dimensions=propagate_dimensions,
+            k=k,
+        )
+        self.bn3 = nn.BatchNorm1d(out_channels, momentum=batchnorm_momentum)
+
+        # Pooling for graph-level representation
+        concat_features = n_gravstack * out_channels
+
+        if pooling == "mean":
+            self.graph_pooling = global_mean_pool
+        elif pooling == "sum":
+            self.graph_pooling = global_add_pool
+        else:
+            raise ValueError(f"Unknown pooling method: {pooling}")
+
+        # FASER feature processing
+        self.faser_mlp = nn.Sequential(
+            nn.Linear(faser_dim, 8),
+            nn.ReLU(),
+        )
+
+        # Regression head (graph features + processed FASER features)
+        combined_features = concat_features + 8
+
+        self.regression_head = nn.Sequential(
+            nn.Linear(combined_features, 32),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(32, 16),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(16, num_targets),
+            # No final activation — raw values for MSE loss
+        )
+
+    def forward(self, x, pos, batch, x_faser):
+        """
+        Forward pass for energy regression with FASER data.
+
+        Args:
+            x: Node features [N, input_dim] (e.g., energy)
+            pos: Node positions [N, 3] (x, y, z coordinates)
+            batch: Batch assignment vector [N] for batched graphs
+            x_faser: FASER spectrometer features [batch_size, faser_dim]
+
+        Returns:
+            predictions: Regression predictions [batch_size, num_targets]
+        """
+        if batch is None:
+            batch = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
+
+        # Concatenate features and positions
+        x = torch.cat([x, pos], dim=-1)  # [N, input_dim + 3]
+
+        # GlobalExchange: append mean of all features to each node
+        global_mean = global_mean_pool(x, batch)  # [batch_size, input_dim + 3]
+        x = torch.cat([x, global_mean[batch]], dim=-1)  # [N, 2*(input_dim + 3)]
+
+        feat = []
+
+        # GravNet stack 1
+        x = F.elu(self.ft1_1(x))
+        x = F.elu(self.ft1_2(x))
+        x = torch.tanh(self.ft1_3(x))
+        x = self.gn1(x, batch)
+        x = self.bn1(x)
+        feat.append(x)
+
+        # GravNet stack 2
+        x = F.elu(self.ft2_1(x))
+        x = F.elu(self.ft2_2(x))
+        x = torch.tanh(self.ft2_3(x))
+        x = self.gn2(x, batch)
+        x = self.bn2(x)
+        feat.append(x)
+
+        # GravNet stack 3
+        x = F.elu(self.ft3_1(x))
+        x = F.elu(self.ft3_2(x))
+        x = torch.tanh(self.ft3_3(x))
+        x = self.gn3(x, batch)
+        x = self.bn3(x)
+        feat.append(x)
+
+        # Concatenate all GravNet block outputs
+        x = torch.cat(feat, dim=1)  # [N, n_gravstack * out_channels]
+
+        # Global pooling for graph-level prediction
+        x_pooled = self.graph_pooling(x, batch)  # [batch_size, n_gravstack * out_channels]
+
+        # Process FASER features
+        # PyG concatenates graph-level [5] tensors flat to [batch_size*5]
+        batch_size = x_pooled.size(0)
+        x_faser_reshaped = x_faser.view(batch_size, -1)  # [batch_size, faser_dim]
+        x_faser_processed = self.faser_mlp(x_faser_reshaped)  # [batch_size, 8]
+
+        # Combine graph features and FASER features
+        x_combined = torch.cat([x_pooled, x_faser_processed], dim=1)
+
+        # Regression prediction
+        return self.regression_head(x_combined)
