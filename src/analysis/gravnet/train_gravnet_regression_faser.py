@@ -242,6 +242,13 @@ def main():
         default="",
         help="Additional suffix to append to output directory name",
     )
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        metavar="CHECKPOINT",
+        help="Path to a checkpoint .pt file to resume training from",
+    )
     args = parser.parse_args()
 
     # Print all arguments
@@ -264,9 +271,9 @@ def main():
     weights_path = get_weights_path() / f"gravnet_regression_faser_{suffix}"
     weights_path.mkdir(parents=True, exist_ok=True)
 
-    # Add file handler to logger
+    # Add file handler to logger (append if resuming, overwrite if fresh run)
     log_file = weights_path / "training.log"
-    file_handler = logging.FileHandler(log_file, mode="w")
+    file_handler = logging.FileHandler(log_file, mode="a" if args.resume else "w")
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(
         logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
@@ -373,7 +380,35 @@ def main():
         "val_resolution": [],
     }
 
-    for epoch in range(args.num_epochs):
+    # Resume from checkpoint if requested
+    start_epoch = 0
+    if args.resume:
+        logger.info(f"Resuming from checkpoint: {args.resume}")
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        if "scheduler_state_dict" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        start_epoch = ckpt["epoch"] + 1
+        best_val_loss = ckpt.get("best_val_loss", ckpt["val_loss"])
+        best_epoch = ckpt.get("best_epoch", ckpt["epoch"])
+        # Restore accumulated per-epoch metrics saved alongside the checkpoint
+        metrics_file = weights_path / "training_metrics.npz"
+        if metrics_file.exists():
+            saved = np.load(metrics_file)
+            for key in metrics:
+                if key in saved:
+                    metrics[key] = list(saved[key])
+            logger.info(
+                f"Restored {len(metrics['train_loss'])} epochs of metrics "
+                f"from {metrics_file}"
+            )
+        logger.info(
+            f"Resuming from epoch {start_epoch + 1}/{args.num_epochs} "
+            f"(best val loss so far: {best_val_loss:.4f} at epoch {best_epoch + 1})"
+        )
+
+    for epoch in range(start_epoch, args.num_epochs):
         # Train
         train_loss, train_rmse, train_rel_err, train_resolution = train_epoch(
             model, train_loader, optimizer, device, args.log_targets
@@ -418,39 +453,60 @@ def main():
                     "epoch": epoch,
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
                     "val_loss": val_loss,
                     "val_rmse": val_rmse,
                     "val_rel_err": val_rel_err.numpy(),
                     "val_resolution": val_resolution.numpy(),
+                    "best_val_loss": best_val_loss,
+                    "best_epoch": best_epoch,
                 },
                 weights_path / "best_model.pt",
             )
             logger.info(f"Saved best model at epoch {epoch + 1}")
 
-        # Save checkpoint every 10 epochs
+        # Save metrics after every epoch so they survive a killed job
+        np.savez(
+            weights_path / "training_metrics.npz",
+            **{key: np.array(value) for key, value in metrics.items()},
+        )
+
+        # Save latest checkpoint every epoch (overwrites) — resume loses at most 1 epoch
+        torch.save(
+            {
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "val_loss": val_loss,
+                "val_rmse": val_rmse,
+                "val_rel_err": val_rel_err.numpy(),
+                "val_resolution": val_resolution.numpy(),
+                "best_val_loss": best_val_loss,
+                "best_epoch": best_epoch,
+            },
+            weights_path / "latest_checkpoint.pt",
+        )
+
+        # Save archival checkpoint every 10 epochs
         if (epoch + 1) % 10 == 0:
             torch.save(
                 {
                     "epoch": epoch,
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
                     "val_loss": val_loss,
                     "val_rmse": val_rmse,
                     "val_rel_err": val_rel_err.numpy(),
                     "val_resolution": val_resolution.numpy(),
+                    "best_val_loss": best_val_loss,
+                    "best_epoch": best_epoch,
                 },
                 weights_path / f"checkpoint_epoch_{epoch + 1}.pt",
             )
 
     logger.info(f"Best validation loss: {best_val_loss:.4f} at epoch {best_epoch + 1}")
-
-    # Save training metrics
-    np.savez(
-        weights_path / "training_metrics.npz",
-        **{
-            key: np.array(value) for key, value in metrics.items()
-        },
-    )
     logger.info(f"Training metrics saved to {weights_path / 'training_metrics.npz'}")
 
 
