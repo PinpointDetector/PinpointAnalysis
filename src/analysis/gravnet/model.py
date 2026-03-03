@@ -1333,8 +1333,12 @@ class NeutrinoGravNetRegressionFASER(nn.Module):
 
         # FASER feature processing
         self.faser_mlp = nn.Sequential(
-            nn.Linear(faser_dim, 8),
-            nn.ReLU(),
+            nn.Linear(faser_dim, 16),
+            nn.SiLU(),
+            nn.Linear(16, 16),
+            nn.SiLU(),
+            nn.Linear(16, 8),
+            nn.SiLU(),
         )
 
         # Regression head (graph features + processed FASER features)
@@ -1342,10 +1346,10 @@ class NeutrinoGravNetRegressionFASER(nn.Module):
 
         self.regression_head = nn.Sequential(
             nn.Linear(combined_features, 32),
-            nn.ReLU(),
+            nn.SiLU(),
             nn.Dropout(dropout),
             nn.Linear(32, 16),
-            nn.ReLU(),
+            nn.SiLU(),
             nn.Dropout(dropout),
             nn.Linear(16, num_targets),
             # No final activation — raw values for MSE loss
