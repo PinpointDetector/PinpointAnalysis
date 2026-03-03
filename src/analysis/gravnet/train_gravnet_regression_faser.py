@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """
 Training script for NeutrinoGravNetRegressionFASER model.
-Predicts E_nu, E_lepton, E_roe from calorimeter graphs with FASER spectrometer features.
+
+Predicts log10(E_nu) and logit(y) where y = E_lepton / E_nu (Bjorken inelasticity).
+E_lepton and E_roe are derived at inference as y·E_nu and (1-y)·E_nu, so energy
+conservation E_lepton + E_roe = E_nu holds exactly by construction.
 
 Usage:
-    python -m analysis.gravnet.train_gravnet_regression_faser -r 10000 -b 8 --num-epochs 50
+    python -m analysis.gravnet.train_gravnet_regression_faser -r 10000 -b 8 --num-epochs 50 --pooling sum
 """
 
 import argparse
@@ -44,15 +47,58 @@ def get_str_from_run(run: int) -> str:
         return "nun"
 
 
-def train_epoch(model, loader, optimizer, device, log_targets):
+def compute_targets(data):
+    """
+    Compute reparametrised training targets from a batch.
+
+    Returns targets [batch_size, 2]:
+        col 0: log10(E_nu)
+        col 1: logit(y) = log(E_lepton / E_roe)  where y = E_lepton / E_nu
+    """
+    E_nu = data.E_nu.clamp(min=1e-6)
+    E_lepton = data.E_lepton.clamp(min=1e-6)
+    E_roe = data.E_roe.clamp(min=1e-6)
+    log_E_nu = torch.log10(E_nu)
+    logit_y = torch.log(E_lepton / E_roe)
+    return torch.stack([log_E_nu, logit_y], dim=1)  # [batch_size, 2]
+
+
+def preds_to_physical(preds, targets):
+    """
+    Convert model outputs and targets to physical energies for metric reporting.
+
+    Args:
+        preds:   [N, 2] — (log10_E_nu_pred, logit_y_pred)
+        targets: [N, 2] — (log10_E_nu_true, logit_y_true)
+
+    Returns:
+        preds_linear, targets_linear: both [N, 3] — (E_nu, E_lepton, E_roe) in TeV
+    """
+    E_nu_pred = 10 ** preds[:, 0]
+    y_pred = torch.sigmoid(preds[:, 1])
+    E_lepton_pred = y_pred * E_nu_pred
+    E_roe_pred = (1 - y_pred) * E_nu_pred
+
+    E_nu_true = 10 ** targets[:, 0]
+    y_true = torch.sigmoid(targets[:, 1])
+    E_lepton_true = y_true * E_nu_true
+    E_roe_true = (1 - y_true) * E_nu_true
+
+    preds_linear = torch.stack([E_nu_pred, E_lepton_pred, E_roe_pred], dim=1)
+    targets_linear = torch.stack([E_nu_true, E_lepton_true, E_roe_true], dim=1)
+    return preds_linear, targets_linear
+
+
+def train_epoch(model, loader, optimizer, device, loss_weights):
     """Train for one epoch."""
     model.train()
     total_loss = 0
     total_events = 0
 
-    # Accumulate for per-target metrics
     all_preds = []
     all_targets = []
+
+    w_enu, w_logit = loss_weights
 
     train_bar = tqdm(loader, desc="Training", disable=not sys.stdout.isatty())
     for batch_idx, data in enumerate(train_bar):
@@ -60,18 +106,11 @@ def train_epoch(model, loader, optimizer, device, log_targets):
         optimizer.zero_grad()
 
         try:
-            # Forward pass
             predictions = model(data.x, data.pos, data.batch, data.x_faser)
+            targets = compute_targets(data)
 
-            # Extract targets
-            targets = torch.stack(
-                [data.E_nu, data.E_lepton, data.E_roe], dim=1
-            )  # [batch_size, 3]
-
-            if log_targets:
-                targets = torch.log10(targets.clamp(min=1e-6))
-
-            loss = F.mse_loss(predictions, targets)
+            loss = (w_enu * F.mse_loss(predictions[:, 0], targets[:, 0]) +
+                    w_logit * F.mse_loss(predictions[:, 1], targets[:, 1]))
 
         except RuntimeError as e:
             print(f"\nSkipping batch {batch_idx} due to error: {e}")
@@ -79,7 +118,6 @@ def train_epoch(model, loader, optimizer, device, log_targets):
 
         loss.backward()
 
-        # Gradient clipping
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
         if grad_norm > 50.0:
             logger.warning(f"Large gradient norm: {grad_norm:.2f}")
@@ -93,37 +131,27 @@ def train_epoch(model, loader, optimizer, device, log_targets):
         all_preds.append(predictions.detach())
         all_targets.append(targets.detach())
 
-        # Update progress bar
         current_loss = total_loss / total_events
         train_bar.set_postfix({"Loss": f"{current_loss:.4f}"})
 
-        # Print log output every 100 batches if progress bar is disabled
         if not sys.stdout.isatty() and (batch_idx + 1) % 100 == 0:
             logger.info(f"Batch {batch_idx + 1}: Loss={current_loss:.4f}")
 
-    # Compute epoch metrics
     avg_loss = total_loss / total_events
     all_preds = torch.cat(all_preds)
     all_targets = torch.cat(all_targets)
 
     rmse = torch.sqrt(torch.tensor(avg_loss))
 
-    # Relative error per target (in linear space for interpretability)
-    if log_targets:
-        preds_linear = 10 ** all_preds
-        targets_linear = 10 ** all_targets
-    else:
-        preds_linear = all_preds
-        targets_linear = all_targets
-
+    preds_linear, targets_linear = preds_to_physical(all_preds, all_targets)
     rel_err = torch.abs(preds_linear - targets_linear) / targets_linear.clamp(min=1e-6)
-    mean_rel_err = rel_err.mean(dim=0)  # [3] per target
-    std_rel_err = rel_err.std(dim=0)  # [3] per target (= resolution)
+    mean_rel_err = rel_err.mean(dim=0)  # [3]
+    std_rel_err = rel_err.std(dim=0)    # [3]
 
     return avg_loss, rmse.item(), mean_rel_err.cpu(), std_rel_err.cpu()
 
 
-def validate_epoch(model, loader, device, log_targets):
+def validate_epoch(model, loader, device, loss_weights):
     """Validate for one epoch."""
     model.eval()
     total_loss = 0
@@ -132,6 +160,8 @@ def validate_epoch(model, loader, device, log_targets):
     all_preds = []
     all_targets = []
 
+    w_enu, w_logit = loss_weights
+
     with torch.no_grad():
         val_bar = tqdm(loader, desc="Validation", disable=not sys.stdout.isatty())
         for data in val_bar:
@@ -139,15 +169,10 @@ def validate_epoch(model, loader, device, log_targets):
 
             try:
                 predictions = model(data.x, data.pos, data.batch, data.x_faser)
+                targets = compute_targets(data)
 
-                targets = torch.stack(
-                    [data.E_nu, data.E_lepton, data.E_roe], dim=1
-                )
-
-                if log_targets:
-                    targets = torch.log10(targets.clamp(min=1e-6))
-
-                loss = F.mse_loss(predictions, targets)
+                loss = (w_enu * F.mse_loss(predictions[:, 0], targets[:, 0]) +
+                        w_logit * F.mse_loss(predictions[:, 1], targets[:, 1]))
 
                 batch_size = predictions.size(0)
                 total_loss += loss.item() * batch_size
@@ -168,14 +193,7 @@ def validate_epoch(model, loader, device, log_targets):
 
     rmse = torch.sqrt(torch.tensor(avg_loss))
 
-    # Relative error per target (in linear space)
-    if log_targets:
-        preds_linear = 10 ** all_preds
-        targets_linear = 10 ** all_targets
-    else:
-        preds_linear = all_preds
-        targets_linear = all_targets
-
+    preds_linear, targets_linear = preds_to_physical(all_preds, all_targets)
     rel_err = torch.abs(preds_linear - targets_linear) / targets_linear.clamp(min=1e-6)
     mean_rel_err = rel_err.mean(dim=0)
     std_rel_err = rel_err.std(dim=0)
@@ -219,19 +237,7 @@ def main():
         type=str,
         default="mean",
         choices=["mean", "sum"],
-        help="Graph pooling method (default: mean)",
-    )
-    parser.add_argument(
-        "--log-targets",
-        action="store_true",
-        default=True,
-        help="Apply log10 transform to energy targets (default: True)",
-    )
-    parser.add_argument(
-        "--no-log-targets",
-        action="store_false",
-        dest="log_targets",
-        help="Disable log10 transform on targets",
+        help="Graph pooling method (default: sum)",
     )
     parser.add_argument(
         "--lr", type=float, default=1e-4, help="Learning rate (default: 1e-4)"
@@ -260,9 +266,7 @@ def main():
     logger.info("=" * 80)
 
     # Build output directory suffix
-    suffix = f"{args.data_type}_events_{args.pooling}"
-    if args.log_targets:
-        suffix += "_log"
+    suffix = f"{args.data_type}_events_{args.pooling}_reparam"
     if args.suffix:
         suffix += f"_{args.suffix}"
 
@@ -293,7 +297,6 @@ def main():
         run_str = get_str_from_run(run)
         run_path = torch_path / f"{run}/pointnetpp_faser_{args.data_type}_events"
 
-        # Get chunks to load
         if args.chunks is None:
             chunk_files = sorted(run_path.glob(f"{run_str}_*.pt"))
             chunks_to_load = [int(f.stem.split("_")[-1]) for f in chunk_files]
@@ -333,6 +336,25 @@ def main():
     logger.info(f"E_lepton: {sample.E_lepton:.4f} TeV")
     logger.info(f"E_roe: {sample.E_roe:.4f} TeV")
 
+    # Compute per-target loss weights from training set variance.
+    # logit(y) has ~30x larger variance than log10(E_nu), so without weighting
+    # the logit MSE dominates the gradient and E_nu gets undertrained.
+    # Weights are inversely proportional to each target's variance, normalised to sum to 1.
+    log_enu_vals = torch.stack(
+        [torch.log10(d.E_nu.clamp(1e-6)) for d in train_dataset]
+    )
+    logit_y_vals = torch.stack(
+        [torch.log(d.E_lepton.clamp(1e-6) / d.E_roe.clamp(1e-6))
+         for d in train_dataset]
+    )
+    w_enu = 1.0 / log_enu_vals.var().clamp(min=1e-6)
+    w_logit = 1.0 / logit_y_vals.var().clamp(min=1e-6)
+    total_w = w_enu + w_logit
+    w_enu = (w_enu / total_w).item()
+    w_logit = (w_logit / total_w).item()
+    loss_weights = (w_enu, w_logit)
+    logger.info(f"Loss weights: w_enu={w_enu:.4f}, w_logit={w_logit:.4f}")
+
     # Create data loaders
     train_loader = DataLoader(
         train_dataset,
@@ -345,10 +367,10 @@ def main():
         shuffle=False,
     )
 
-    # Create model
+    # Create model (2 outputs: log10 E_nu, logit y)
     model = NeutrinoGravNetRegressionFASER(
         input_dim=sample.x.shape[1],
-        num_targets=3,
+        num_targets=2,
         faser_dim=sample.x_faser.shape[0],
         pooling=args.pooling,
         dropout=0.2,
@@ -374,9 +396,9 @@ def main():
         "train_rmse": [],
         "val_loss": [],
         "val_rmse": [],
-        "train_rel_err": [],  # [epochs, 3]
+        "train_rel_err": [],   # [epochs, 3] — E_nu, E_lepton, E_roe in physical space
         "val_rel_err": [],
-        "train_resolution": [],  # [epochs, 3]
+        "train_resolution": [],
         "val_resolution": [],
     }
 
@@ -392,7 +414,6 @@ def main():
         start_epoch = ckpt["epoch"] + 1
         best_val_loss = ckpt.get("best_val_loss", ckpt["val_loss"])
         best_epoch = ckpt.get("best_epoch", ckpt["epoch"])
-        # Restore accumulated per-epoch metrics saved alongside the checkpoint
         metrics_file = weights_path / "training_metrics.npz"
         if metrics_file.exists():
             saved = np.load(metrics_file)
@@ -409,20 +430,16 @@ def main():
         )
 
     for epoch in range(start_epoch, args.num_epochs):
-        # Train
         train_loss, train_rmse, train_rel_err, train_resolution = train_epoch(
-            model, train_loader, optimizer, device, args.log_targets
+            model, train_loader, optimizer, device, loss_weights
         )
 
-        # Validate
         val_loss, val_rmse, val_rel_err, val_resolution = validate_epoch(
-            model, val_loader, device, args.log_targets
+            model, val_loader, device, loss_weights
         )
 
-        # Update scheduler
         scheduler.step(val_loss)
 
-        # Store metrics
         metrics["train_loss"].append(train_loss)
         metrics["train_rmse"].append(train_rmse)
         metrics["val_loss"].append(val_loss)
@@ -432,7 +449,6 @@ def main():
         metrics["train_resolution"].append(train_resolution.numpy())
         metrics["val_resolution"].append(val_resolution.numpy())
 
-        # Log
         rel_err_str = ", ".join(
             f"{TARGET_NAMES[i]}: {val_rel_err[i]:.3f}±{val_resolution[i]:.3f}"
             for i in range(3)
@@ -444,67 +460,38 @@ def main():
             f"Val RelErr: {rel_err_str}"
         )
 
-        # Save best model
+        checkpoint = {
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "val_loss": val_loss,
+            "val_rmse": val_rmse,
+            "val_rel_err": val_rel_err.numpy(),
+            "val_resolution": val_resolution.numpy(),
+            "best_val_loss": best_val_loss,
+            "best_epoch": best_epoch,
+            "loss_weights": loss_weights,
+            "parametrisation": "reparam",
+        }
+
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_epoch = epoch
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "scheduler_state_dict": scheduler.state_dict(),
-                    "val_loss": val_loss,
-                    "val_rmse": val_rmse,
-                    "val_rel_err": val_rel_err.numpy(),
-                    "val_resolution": val_resolution.numpy(),
-                    "best_val_loss": best_val_loss,
-                    "best_epoch": best_epoch,
-                },
-                weights_path / "best_model.pt",
-            )
+            checkpoint["best_val_loss"] = best_val_loss
+            checkpoint["best_epoch"] = best_epoch
+            torch.save(checkpoint, weights_path / "best_model.pt")
             logger.info(f"Saved best model at epoch {epoch + 1}")
 
-        # Save metrics after every epoch so they survive a killed job
         np.savez(
             weights_path / "training_metrics.npz",
             **{key: np.array(value) for key, value in metrics.items()},
         )
 
-        # Save latest checkpoint every epoch (overwrites) — resume loses at most 1 epoch
-        torch.save(
-            {
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scheduler_state_dict": scheduler.state_dict(),
-                "val_loss": val_loss,
-                "val_rmse": val_rmse,
-                "val_rel_err": val_rel_err.numpy(),
-                "val_resolution": val_resolution.numpy(),
-                "best_val_loss": best_val_loss,
-                "best_epoch": best_epoch,
-            },
-            weights_path / "latest_checkpoint.pt",
-        )
+        torch.save(checkpoint, weights_path / "latest_checkpoint.pt")
 
-        # Save archival checkpoint every 10 epochs
         if (epoch + 1) % 10 == 0:
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "scheduler_state_dict": scheduler.state_dict(),
-                    "val_loss": val_loss,
-                    "val_rmse": val_rmse,
-                    "val_rel_err": val_rel_err.numpy(),
-                    "val_resolution": val_resolution.numpy(),
-                    "best_val_loss": best_val_loss,
-                    "best_epoch": best_epoch,
-                },
-                weights_path / f"checkpoint_epoch_{epoch + 1}.pt",
-            )
+            torch.save(checkpoint, weights_path / f"checkpoint_epoch_{epoch + 1}.pt")
 
     logger.info(f"Best validation loss: {best_val_loss:.4f} at epoch {best_epoch + 1}")
     logger.info(f"Training metrics saved to {weights_path / 'training_metrics.npz'}")
