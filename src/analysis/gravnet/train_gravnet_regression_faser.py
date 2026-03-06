@@ -47,40 +47,52 @@ def get_str_from_run(run: int) -> str:
         return "nun"
 
 
-def compute_targets(data):
+def compute_targets(data, norm_stats):
     """
-    Compute reparametrised training targets from a batch.
+    Compute reparametrised, standardised training targets from a batch.
+
+    Both targets are standardised to zero mean / unit variance using training-set
+    statistics so equal MSE weights are appropriate.
 
     Returns targets [batch_size, 2]:
-        col 0: log10(E_nu)
-        col 1: logit(y) = log(E_lepton / E_roe)  where y = E_lepton / E_nu
+        col 0: (log10(E_nu) - mu_enu) / sigma_enu
+        col 1: (logit(y) - mu_logit) / sigma_logit   where y = E_lepton / E_nu
     """
     E_nu = data.E_nu.clamp(min=1e-6)
     E_lepton = data.E_lepton.clamp(min=1e-6)
     E_roe = data.E_roe.clamp(min=1e-6)
     log_E_nu = torch.log10(E_nu)
     logit_y = torch.log(E_lepton / E_roe)
-    return torch.stack([log_E_nu, logit_y], dim=1)  # [batch_size, 2]
+    log_E_nu_std = (log_E_nu - norm_stats["mu_enu"]) / norm_stats["sigma_enu"]
+    logit_y_std  = (logit_y  - norm_stats["mu_logit"]) / norm_stats["sigma_logit"]
+    return torch.stack([log_E_nu_std, logit_y_std], dim=1)  # [batch_size, 2]
 
 
-def preds_to_physical(preds, targets):
+def preds_to_physical(preds, targets, norm_stats):
     """
-    Convert model outputs and targets to physical energies for metric reporting.
+    Convert standardised model outputs and targets to physical energies.
 
     Args:
-        preds:   [N, 2] — (log10_E_nu_pred, logit_y_pred)
-        targets: [N, 2] — (log10_E_nu_true, logit_y_true)
+        preds:      [N, 2] — standardised (log10_E_nu, logit_y)
+        targets:    [N, 2] — standardised (log10_E_nu, logit_y)
+        norm_stats: dict with mu_enu, sigma_enu, mu_logit, sigma_logit
 
     Returns:
         preds_linear, targets_linear: both [N, 3] — (E_nu, E_lepton, E_roe) in TeV
     """
-    E_nu_pred = 10 ** preds[:, 0]
-    y_pred = torch.sigmoid(preds[:, 1])
+    # Destandardise back to reparam space
+    log_E_nu_pred = preds[:, 0] * norm_stats["sigma_enu"]   + norm_stats["mu_enu"]
+    logit_y_pred  = preds[:, 1] * norm_stats["sigma_logit"] + norm_stats["mu_logit"]
+    log_E_nu_true = targets[:, 0] * norm_stats["sigma_enu"]   + norm_stats["mu_enu"]
+    logit_y_true  = targets[:, 1] * norm_stats["sigma_logit"] + norm_stats["mu_logit"]
+
+    E_nu_pred = 10 ** log_E_nu_pred
+    y_pred = torch.sigmoid(logit_y_pred)
     E_lepton_pred = y_pred * E_nu_pred
     E_roe_pred = (1 - y_pred) * E_nu_pred
 
-    E_nu_true = 10 ** targets[:, 0]
-    y_true = torch.sigmoid(targets[:, 1])
+    E_nu_true = 10 ** log_E_nu_true
+    y_true = torch.sigmoid(logit_y_true)
     E_lepton_true = y_true * E_nu_true
     E_roe_true = (1 - y_true) * E_nu_true
 
@@ -89,7 +101,7 @@ def preds_to_physical(preds, targets):
     return preds_linear, targets_linear
 
 
-def train_epoch(model, loader, optimizer, device, loss_weights):
+def train_epoch(model, loader, optimizer, device, norm_stats):
     """Train for one epoch."""
     model.train()
     total_loss = 0
@@ -98,8 +110,6 @@ def train_epoch(model, loader, optimizer, device, loss_weights):
     all_preds = []
     all_targets = []
 
-    w_enu, w_logit = loss_weights
-
     train_bar = tqdm(loader, desc="Training", disable=not sys.stdout.isatty())
     for batch_idx, data in enumerate(train_bar):
         data = data.to(device)
@@ -107,10 +117,10 @@ def train_epoch(model, loader, optimizer, device, loss_weights):
 
         try:
             predictions = model(data.x, data.pos, data.batch, data.x_faser)
-            targets = compute_targets(data)
+            targets = compute_targets(data, norm_stats)
 
-            loss = (w_enu * F.mse_loss(predictions[:, 0], targets[:, 0]) +
-                    w_logit * F.mse_loss(predictions[:, 1], targets[:, 1]))
+            loss = (F.mse_loss(predictions[:, 0], targets[:, 0]) +
+                    F.mse_loss(predictions[:, 1], targets[:, 1]))
 
         except RuntimeError as e:
             print(f"\nSkipping batch {batch_idx} due to error: {e}")
@@ -143,7 +153,7 @@ def train_epoch(model, loader, optimizer, device, loss_weights):
 
     rmse = torch.sqrt(torch.tensor(avg_loss))
 
-    preds_linear, targets_linear = preds_to_physical(all_preds, all_targets)
+    preds_linear, targets_linear = preds_to_physical(all_preds, all_targets, norm_stats)
     rel_err = torch.abs(preds_linear - targets_linear) / targets_linear.clamp(min=1e-6)
     mean_rel_err = rel_err.mean(dim=0)  # [3]
     std_rel_err = rel_err.std(dim=0)    # [3]
@@ -151,7 +161,7 @@ def train_epoch(model, loader, optimizer, device, loss_weights):
     return avg_loss, rmse.item(), mean_rel_err.cpu(), std_rel_err.cpu()
 
 
-def validate_epoch(model, loader, device, loss_weights):
+def validate_epoch(model, loader, device, norm_stats):
     """Validate for one epoch."""
     model.eval()
     total_loss = 0
@@ -160,8 +170,6 @@ def validate_epoch(model, loader, device, loss_weights):
     all_preds = []
     all_targets = []
 
-    w_enu, w_logit = loss_weights
-
     with torch.no_grad():
         val_bar = tqdm(loader, desc="Validation", disable=not sys.stdout.isatty())
         for data in val_bar:
@@ -169,10 +177,10 @@ def validate_epoch(model, loader, device, loss_weights):
 
             try:
                 predictions = model(data.x, data.pos, data.batch, data.x_faser)
-                targets = compute_targets(data)
+                targets = compute_targets(data, norm_stats)
 
-                loss = (w_enu * F.mse_loss(predictions[:, 0], targets[:, 0]) +
-                        w_logit * F.mse_loss(predictions[:, 1], targets[:, 1]))
+                loss = (F.mse_loss(predictions[:, 0], targets[:, 0]) +
+                        F.mse_loss(predictions[:, 1], targets[:, 1]))
 
                 batch_size = predictions.size(0)
                 total_loss += loss.item() * batch_size
@@ -193,7 +201,7 @@ def validate_epoch(model, loader, device, loss_weights):
 
     rmse = torch.sqrt(torch.tensor(avg_loss))
 
-    preds_linear, targets_linear = preds_to_physical(all_preds, all_targets)
+    preds_linear, targets_linear = preds_to_physical(all_preds, all_targets, norm_stats)
     rel_err = torch.abs(preds_linear - targets_linear) / targets_linear.clamp(min=1e-6)
     mean_rel_err = rel_err.mean(dim=0)
     std_rel_err = rel_err.std(dim=0)
@@ -266,7 +274,7 @@ def main():
     logger.info("=" * 80)
 
     # Build output directory suffix
-    suffix = f"{args.data_type}_events_{args.pooling}_reparam"
+    suffix = f"{args.data_type}_events_{args.pooling}_reparam_std"
     if args.suffix:
         suffix += f"_{args.suffix}"
 
@@ -336,10 +344,10 @@ def main():
     logger.info(f"E_lepton: {sample.E_lepton:.4f} TeV")
     logger.info(f"E_roe: {sample.E_roe:.4f} TeV")
 
-    # Compute per-target loss weights from training set variance.
-    # logit(y) has ~30x larger variance than log10(E_nu), so without weighting
-    # the logit MSE dominates the gradient and E_nu gets undertrained.
-    # Weights are inversely proportional to each target's variance, normalised to sum to 1.
+    # Compute normalisation statistics from training set.
+    # Standardising both targets to zero mean / unit variance removes the
+    # ~31x scale difference between log10(E_nu) and logit(y), so equal MSE
+    # weights are correct and neither target dominates the gradient.
     log_enu_vals = torch.stack(
         [torch.log10(d.E_nu.clamp(1e-6)) for d in train_dataset]
     )
@@ -347,13 +355,20 @@ def main():
         [torch.log(d.E_lepton.clamp(1e-6) / d.E_roe.clamp(1e-6))
          for d in train_dataset]
     )
-    w_enu = 1.0 / log_enu_vals.var().clamp(min=1e-6)
-    w_logit = 1.0 / logit_y_vals.var().clamp(min=1e-6)
-    total_w = w_enu + w_logit
-    w_enu = (w_enu / total_w).item()
-    w_logit = (w_logit / total_w).item()
-    loss_weights = (w_enu, w_logit)
-    logger.info(f"Loss weights: w_enu={w_enu:.4f}, w_logit={w_logit:.4f}")
+    norm_stats = {
+        "mu_enu":    log_enu_vals.mean().item(),
+        "sigma_enu": log_enu_vals.std().item(),
+        "mu_logit":  logit_y_vals.mean().item(),
+        "sigma_logit": logit_y_vals.std().item(),
+    }
+    logger.info(
+        f"Normalisation — log10(E_nu): mu={norm_stats['mu_enu']:.4f}, "
+        f"sigma={norm_stats['sigma_enu']:.4f}"
+    )
+    logger.info(
+        f"Normalisation — logit(y):    mu={norm_stats['mu_logit']:.4f}, "
+        f"sigma={norm_stats['sigma_logit']:.4f}"
+    )
 
     # Create data loaders
     train_loader = DataLoader(
@@ -431,11 +446,11 @@ def main():
 
     for epoch in range(start_epoch, args.num_epochs):
         train_loss, train_rmse, train_rel_err, train_resolution = train_epoch(
-            model, train_loader, optimizer, device, loss_weights
+            model, train_loader, optimizer, device, norm_stats
         )
 
         val_loss, val_rmse, val_rel_err, val_resolution = validate_epoch(
-            model, val_loader, device, loss_weights
+            model, val_loader, device, norm_stats
         )
 
         scheduler.step(val_loss)
@@ -471,8 +486,8 @@ def main():
             "val_resolution": val_resolution.numpy(),
             "best_val_loss": best_val_loss,
             "best_epoch": best_epoch,
-            "loss_weights": loss_weights,
-            "parametrisation": "reparam",
+            "norm_stats": norm_stats,
+            "parametrisation": "reparam_std",
         }
 
         if val_loss < best_val_loss:
