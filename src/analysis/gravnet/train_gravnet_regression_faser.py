@@ -2,7 +2,8 @@
 """
 Training script for NeutrinoGravNetRegressionFASER model.
 
-Predicts log10(E_nu) and logit(y) where y = E_lepton / E_nu (Bjorken inelasticity).
+Predicts log10(E_nu) and logit(y) where y = E_lepton / E_nu (lepton energy fraction).
+Note: this is 1 - y_Bjorken (Bjorken inelasticity = E_roe/E_nu = hadronic energy fraction).
 E_lepton and E_roe are derived at inference as y·E_nu and (1-y)·E_nu, so energy
 conservation E_lepton + E_roe = E_nu holds exactly by construction.
 
@@ -11,6 +12,7 @@ Usage:
 """
 
 import argparse
+import datetime
 import logging
 import sys
 
@@ -56,7 +58,7 @@ def compute_targets(data, norm_stats):
 
     Returns targets [batch_size, 2]:
         col 0: (log10(E_nu) - mu_enu) / sigma_enu
-        col 1: (logit(y) - mu_logit) / sigma_logit   where y = E_lepton / E_nu
+        col 1: (logit(y) - mu_logit) / sigma_logit   where y = E_lepton / E_nu  (lepton fraction = 1 - y_Bjorken)
     """
     E_nu = data.E_nu.clamp(min=1e-6)
     E_lepton = data.E_lepton.clamp(min=1e-6)
@@ -101,7 +103,13 @@ def preds_to_physical(preds, targets, norm_stats):
     return preds_linear, targets_linear
 
 
-def train_epoch(model, loader, optimizer, device, norm_stats):
+def compute_loss(pred, target, loss_fn, huber_delta=1.0):
+    if loss_fn == "huber":
+        return F.huber_loss(pred, target, delta=huber_delta)
+    return F.mse_loss(pred, target)
+
+
+def train_epoch(model, loader, optimizer, device, norm_stats, loss_fn="mse", huber_delta=1.0, scaler=None, fp16=False):
     """Train for one epoch."""
     model.train()
     total_loss = 0
@@ -116,23 +124,26 @@ def train_epoch(model, loader, optimizer, device, norm_stats):
         optimizer.zero_grad()
 
         try:
-            predictions = model(data.x, data.pos, data.batch, data.x_faser)
-            targets = compute_targets(data, norm_stats)
+            with torch.cuda.amp.autocast(enabled=fp16):
+                predictions = model(data.x, data.pos, data.batch, data.x_faser)
+                targets = compute_targets(data, norm_stats)
 
-            loss = (F.mse_loss(predictions[:, 0], targets[:, 0]) +
-                    F.mse_loss(predictions[:, 1], targets[:, 1]))
+                loss = (compute_loss(predictions[:, 0], targets[:, 0], loss_fn, huber_delta) +
+                        compute_loss(predictions[:, 1], targets[:, 1], loss_fn, huber_delta))
 
         except RuntimeError as e:
             print(f"\nSkipping batch {batch_idx} due to error: {e}")
             continue
 
-        loss.backward()
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
 
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
         if grad_norm > 50.0:
             logger.warning(f"Large gradient norm: {grad_norm:.2f}")
 
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
 
         batch_size = predictions.size(0)
         total_loss += loss.item() * batch_size
@@ -151,7 +162,10 @@ def train_epoch(model, loader, optimizer, device, norm_stats):
     all_preds = torch.cat(all_preds)
     all_targets = torch.cat(all_targets)
 
-    rmse = torch.sqrt(torch.tensor(avg_loss))
+    if loss_fn == "mse":
+        rmse = torch.sqrt(torch.tensor(avg_loss))
+    else:
+        rmse = torch.sqrt(F.mse_loss(all_preds, all_targets))
 
     preds_linear, targets_linear = preds_to_physical(all_preds, all_targets, norm_stats)
     rel_err = torch.abs(preds_linear - targets_linear) / targets_linear.clamp(min=1e-6)
@@ -161,7 +175,7 @@ def train_epoch(model, loader, optimizer, device, norm_stats):
     return avg_loss, rmse.item(), mean_rel_err.cpu(), std_rel_err.cpu()
 
 
-def validate_epoch(model, loader, device, norm_stats):
+def validate_epoch(model, loader, device, norm_stats, loss_fn="mse", huber_delta=1.0, fp16=False):
     """Validate for one epoch."""
     model.eval()
     total_loss = 0
@@ -176,11 +190,12 @@ def validate_epoch(model, loader, device, norm_stats):
             data = data.to(device)
 
             try:
-                predictions = model(data.x, data.pos, data.batch, data.x_faser)
-                targets = compute_targets(data, norm_stats)
+                with torch.cuda.amp.autocast(enabled=fp16):
+                    predictions = model(data.x, data.pos, data.batch, data.x_faser)
+                    targets = compute_targets(data, norm_stats)
 
-                loss = (F.mse_loss(predictions[:, 0], targets[:, 0]) +
-                        F.mse_loss(predictions[:, 1], targets[:, 1]))
+                loss = (compute_loss(predictions[:, 0], targets[:, 0], loss_fn, huber_delta) +
+                        compute_loss(predictions[:, 1], targets[:, 1], loss_fn, huber_delta))
 
                 batch_size = predictions.size(0)
                 total_loss += loss.item() * batch_size
@@ -199,7 +214,10 @@ def validate_epoch(model, loader, device, norm_stats):
     all_preds = torch.cat(all_preds)
     all_targets = torch.cat(all_targets)
 
-    rmse = torch.sqrt(torch.tensor(avg_loss))
+    if loss_fn == "mse":
+        rmse = torch.sqrt(torch.tensor(avg_loss))
+    else:
+        rmse = torch.sqrt(F.mse_loss(all_preds, all_targets))
 
     preds_linear, targets_linear = preds_to_physical(all_preds, all_targets, norm_stats)
     rel_err = torch.abs(preds_linear - targets_linear) / targets_linear.clamp(min=1e-6)
@@ -257,11 +275,54 @@ def main():
         help="Additional suffix to append to output directory name",
     )
     parser.add_argument(
+        "--loss",
+        type=str,
+        default="mse",
+        choices=["mse", "huber"],
+        help="Loss function (default: mse)",
+    )
+    parser.add_argument(
+        "--huber-delta",
+        type=float,
+        default=1.0,
+        help="Delta parameter for Huber loss (default: 1.0)",
+    )
+    parser.add_argument(
+        "--fp16",
+        action="store_true",
+        default=False,
+        help="Use mixed precision training (torch.cuda.amp)",
+    )
+    parser.add_argument(
+        "--bin-size",
+        type=str,
+        default="200um",
+        help="Bin size of the input .pt files, e.g. '200um' or '100um' (default: 200um)",
+    )
+    parser.add_argument(
         "--resume",
         type=str,
         default=None,
         metavar="CHECKPOINT",
         help="Path to a checkpoint .pt file to resume training from",
+    )
+    parser.add_argument(
+        "--truth-label",
+        action="store_true",
+        default=False,
+        help="Augment node features with one-hot truth node labels (3-class: other/e/mu)",
+    )
+    parser.add_argument(
+        "--truth-label-4",
+        action="store_true",
+        default=False,
+        help="Augment node features with one-hot raw pdg_label (4-class: other/secondary_e/primary_EM_e/mu)",
+    )
+    parser.add_argument(
+        "--faser-global",
+        action="store_true",
+        default=False,
+        help="Broadcast x_faser features to every node before GNN (global variable injection).",
     )
     args = parser.parse_args()
 
@@ -275,12 +336,30 @@ def main():
 
     # Build output directory suffix
     suffix = f"{args.data_type}_events_{args.pooling}_reparam_std"
+    if args.loss != "mse":
+        suffix += f"_{args.loss}"
+        if args.loss == "huber":
+            suffix += f"{args.huber_delta}"
+    if args.truth_label:
+        suffix += "_truth3"
+    if args.truth_label_4:
+        suffix += "_truth4"
+    if args.faser_global:
+        suffix += "_faserglobal"
+    if args.fp16:
+        suffix += "_fp16"
+    if args.bin_size != "200um":
+        suffix += f"_{args.bin_size}"
     if args.suffix:
         suffix += f"_{args.suffix}"
 
     # Setup paths
     torch_path = get_torch_path()
     weights_path = get_weights_path() / f"gravnet_regression_faser_{suffix}"
+    if weights_path.exists() and not args.resume:
+        stamp = datetime.datetime.now().strftime("%m%d_%H%M")
+        weights_path = weights_path.parent / f"{weights_path.name}_{stamp}"
+        logger.warning(f"Output directory already exists — writing to {weights_path}")
     weights_path.mkdir(parents=True, exist_ok=True)
 
     # Add file handler to logger (append if resuming, overwrite if fresh run)
@@ -301,9 +380,10 @@ def main():
     logger.info("Loading datasets...")
 
     dataset = []
+    bin_suffix = f"_{args.bin_size}" if args.bin_size != "200um" else ""
     for run in args.runs:
         run_str = get_str_from_run(run)
-        run_path = torch_path / f"{run}/pointnetpp_faser_{args.data_type}_events"
+        run_path = torch_path / f"{run}/pointnetpp_faser_{args.data_type}_events{bin_suffix}"
 
         if args.chunks is None:
             chunk_files = sorted(run_path.glob(f"{run_str}_*.pt"))
@@ -325,6 +405,23 @@ def main():
                 logger.warning(f"  Chunk file not found: {chunk_file}")
 
     logger.info(f"Total loaded events: {len(dataset)}")
+
+    # Optionally augment node features with one-hot truth labels
+    if args.truth_label:
+        logger.info("Augmenting node features with one-hot truth labels (3 classes: other/e/mu).")
+        for data in dataset:
+            y_oh = F.one_hot(data.y, num_classes=3).float()
+            data.x = torch.cat([data.x, y_oh], dim=1)
+    if args.truth_label_4:
+        logger.info("Augmenting node features with one-hot raw pdg_label (4 classes).")
+        for data in dataset:
+            y_oh = F.one_hot(data.pdg_label, num_classes=4).float()
+            data.x = torch.cat([data.x, y_oh], dim=1)
+    if args.faser_global:
+        logger.info("Augmenting node features with global FASER features (injected to each node).")
+        for data in dataset:
+            faser_expanded = data.x_faser.unsqueeze(0).expand(data.num_nodes, -1)
+            data.x = torch.cat([data.x, faser_expanded], dim=1)
 
     # Split into train/val
     train_dataset, val_dataset = train_test_split(
@@ -401,6 +498,7 @@ def main():
     scheduler = ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=10, verbose=True
     )
+    scaler = torch.cuda.amp.GradScaler(enabled=args.fp16)
 
     # Training loop
     best_val_loss = float("inf")
@@ -446,11 +544,13 @@ def main():
 
     for epoch in range(start_epoch, args.num_epochs):
         train_loss, train_rmse, train_rel_err, train_resolution = train_epoch(
-            model, train_loader, optimizer, device, norm_stats
+            model, train_loader, optimizer, device, norm_stats, args.loss, args.huber_delta,
+            scaler=scaler, fp16=args.fp16,
         )
 
         val_loss, val_rmse, val_rel_err, val_resolution = validate_epoch(
-            model, val_loader, device, norm_stats
+            model, val_loader, device, norm_stats, args.loss, args.huber_delta,
+            fp16=args.fp16,
         )
 
         scheduler.step(val_loss)
@@ -488,6 +588,10 @@ def main():
             "best_epoch": best_epoch,
             "norm_stats": norm_stats,
             "parametrisation": "reparam_std",
+            "loss_fn": args.loss,
+            "huber_delta": args.huber_delta,
+            "fp16": args.fp16,
+            "bin_size": args.bin_size,
         }
 
         if val_loss < best_val_loss:

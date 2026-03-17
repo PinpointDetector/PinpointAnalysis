@@ -63,6 +63,7 @@ def create_event_graph(
     # Merge primary and non-primary electrons
     hits_df["label"] = hits_df["pdg_label"].replace({2: 1, 3: 2})
     y_node = torch.tensor(hits_df["label"].values.astype(np.int64), dtype=torch.long)
+    pdg_label_node = torch.tensor(hits_df["pdg_label"].values.astype(np.int64), dtype=torch.long)
 
     # Graph-level label (event classification)
     y_graph = torch.tensor([label], dtype=torch.long)
@@ -99,6 +100,7 @@ def create_event_graph(
         x=x_tensor,  # [N, 1] node features (nhits)
         pos=pos_tensor,  # [N, 3] positions (x, y, z)
         y=y_node,  # [N] node labels
+        pdg_label=pdg_label_node,  # [N] 4-class labels (0=other, 1=secondary_e, 2=primary_EM_e, 3=muon)
         y_graph=y_graph,  # [1] graph label
         x_faser=x_faser_tensor,  # [5] FASER spectrometer features (event-level)
         E_nu=E_nu,  # neutrino energy (TeV)
@@ -161,6 +163,7 @@ def create_graph_data(
     num_events: int | None = None,
     use_faser: bool = True,
     apply_good_event_selection: bool = False,
+    bin_size: str = "200um",
 ) -> None:
     """
     Create PointNet++ compatible graph data for a single chunk.
@@ -175,7 +178,7 @@ def create_graph_data(
     """
     run_str = get_str_from_run(run)
     label = get_label_from_run(run)
-    run_path = get_parquet_path() / f"{run}/200um_bins"
+    run_path = get_parquet_path() / f"{run}/{bin_size}_bins"
     output_path = get_torch_path() / f"{run}"
     if use_faser:
         output_path = output_path / "pointnetpp_faser"
@@ -185,6 +188,8 @@ def create_graph_data(
         output_path = output_path.parent / f"{output_path.name}_good_events"
     else:
         output_path = output_path.parent / f"{output_path.name}_all_events"
+    if bin_size != "200um":
+        output_path = output_path.parent / f"{output_path.name}_{bin_size}"
     output_path.mkdir(parents=True, exist_ok=True)
 
     data_path = output_path / f"{run_str}_{chunk:03d}.pt"
@@ -300,6 +305,12 @@ def main() -> None:
         help="Recreate existing data files",
     )
     parser.add_argument(
+        "--bin-size",
+        type=str,
+        default="200um",
+        help="Bin size subdirectory to read from, e.g. '200um' or '100um' (default: 200um)",
+    )
+    parser.add_argument(
         "--use-faser",
         action="store_true",
         default=True,
@@ -330,7 +341,7 @@ def main() -> None:
     for run in args.runs:
         logging.info(f"Processing run {run}.")
         if args.chunks is None:
-            run_path = get_parquet_path() / f"{run}/200um_bins"
+            run_path = get_parquet_path() / f"{run}/{args.bin_size}_bins"
             files = list(run_path.glob(f"{run:05d}_*_hits.parq"))
             chunks = sorted([int(f.stem.split("_")[1]) for f in files])
         else:
@@ -345,6 +356,7 @@ def main() -> None:
                 num_events=args.num_events,
                 use_faser=args.use_faser,
                 apply_good_event_selection=args.good_event_selection,
+                bin_size=args.bin_size,
             )
 
 
