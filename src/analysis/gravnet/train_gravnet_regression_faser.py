@@ -324,6 +324,12 @@ def main():
         default=False,
         help="Broadcast x_faser features to every node before GNN (global variable injection).",
     )
+    parser.add_argument(
+        "--particle-prob",
+        action="store_true",
+        default=False,
+        help="Load *_particle_prob.pt files (data.x augmented with 4-class node softmax probs).",
+    )
     args = parser.parse_args()
 
     # Print all arguments
@@ -346,6 +352,8 @@ def main():
         suffix += "_truth4"
     if args.faser_global:
         suffix += "_faserglobal"
+    if args.particle_prob:
+        suffix += "_prob"
     if args.fp16:
         suffix += "_fp16"
     if args.bin_size != "200um":
@@ -387,14 +395,16 @@ def main():
 
         if args.chunks is None:
             chunk_files = sorted(run_path.glob(f"{run_str}_*.pt"))
+            chunk_files = [f for f in chunk_files if "_particle_prob" not in f.stem]
             chunks_to_load = [int(f.stem.split("_")[-1]) for f in chunk_files]
         else:
             chunks_to_load = args.chunks
 
         logger.info(f"Loading {len(chunks_to_load)} chunks for run {run} ({run_str})")
 
+        file_suffix = "_particle_prob" if args.particle_prob else ""
         for chunk in chunks_to_load:
-            chunk_file = run_path / f"{run_str}_{chunk:03d}.pt"
+            chunk_file = run_path / f"{run_str}_{chunk:03d}{file_suffix}.pt"
             if chunk_file.exists():
                 chunk_data = torch.load(chunk_file, weights_only=False)
                 if args.num_events is not None:
