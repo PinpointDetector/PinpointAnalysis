@@ -1092,44 +1092,28 @@ class NeutrinoGravNetNodesFaser(nn.Module):
         # After GlobalExchange, input doubles (original + global mean)
         initial_features = input_with_pos * 2
 
-        # GravNet stack 1
-        self.ft1_1 = nn.Linear(initial_features, n_feature_transform)
-        self.ft1_2 = nn.Linear(n_feature_transform, n_feature_transform)
-        self.ft1_3 = nn.Linear(n_feature_transform, n_feature_transform)
-        self.gn1 = GravNetConv(
-            in_channels=n_feature_transform,
-            out_channels=out_channels,
-            space_dimensions=space_dimensions,
-            propagate_dimensions=propagate_dimensions,
-            k=k,
-        )
-        self.bn1 = nn.BatchNorm1d(out_channels, momentum=batchnorm_momentum)
-
-        # GravNet stack 2
-        self.ft2_1 = nn.Linear(out_channels, n_feature_transform)
-        self.ft2_2 = nn.Linear(n_feature_transform, n_feature_transform)
-        self.ft2_3 = nn.Linear(n_feature_transform, n_feature_transform)
-        self.gn2 = GravNetConv(
-            in_channels=n_feature_transform,
-            out_channels=out_channels,
-            space_dimensions=space_dimensions,
-            propagate_dimensions=propagate_dimensions,
-            k=k,
-        )
-        self.bn2 = nn.BatchNorm1d(out_channels, momentum=batchnorm_momentum)
-
-        # GravNet stack 3
-        self.ft3_1 = nn.Linear(out_channels, n_feature_transform)
-        self.ft3_2 = nn.Linear(n_feature_transform, n_feature_transform)
-        self.ft3_3 = nn.Linear(n_feature_transform, n_feature_transform)
-        self.gn3 = GravNetConv(
-            in_channels=n_feature_transform,
-            out_channels=out_channels,
-            space_dimensions=space_dimensions,
-            propagate_dimensions=propagate_dimensions,
-            k=k,
-        )
-        self.bn3 = nn.BatchNorm1d(out_channels, momentum=batchnorm_momentum)
+        # GravNet stacks — dynamic number via nn.ModuleList
+        # fts[i]: [Linear, Linear, Linear] feature transforms for block i
+        # gns[i]: GravNetConv for block i
+        # bns[i]: BatchNorm for block i
+        self.fts = nn.ModuleList()
+        self.gns = nn.ModuleList()
+        self.bns = nn.ModuleList()
+        for i in range(n_gravstack):
+            in_dim = initial_features if i == 0 else out_channels
+            self.fts.append(nn.ModuleList([
+                nn.Linear(in_dim, n_feature_transform),
+                nn.Linear(n_feature_transform, n_feature_transform),
+                nn.Linear(n_feature_transform, n_feature_transform),
+            ]))
+            self.gns.append(GravNetConv(
+                in_channels=n_feature_transform,
+                out_channels=out_channels,
+                space_dimensions=space_dimensions,
+                propagate_dimensions=propagate_dimensions,
+                k=k,
+            ))
+            self.bns.append(nn.BatchNorm1d(out_channels, momentum=batchnorm_momentum))
 
         # After concatenating all GravNet outputs
         concat_features = n_gravstack * out_channels
@@ -1143,16 +1127,17 @@ class NeutrinoGravNetNodesFaser(nn.Module):
             nn.ReLU(),
         )
 
-        # Node-level classification head (node features + processed FASER features)
+        # Node-level classification head — intermediate dims scale with out_channels
         node_combined_features = concat_features + 8
+        head_hidden = max(32, 2 * out_channels)
         self.node_classifier = nn.Sequential(
-            nn.Linear(node_combined_features, 32),
+            nn.Linear(node_combined_features, head_hidden),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(32, 16),
+            nn.Linear(head_hidden, head_hidden // 2),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(16, num_node_classes),
+            nn.Linear(head_hidden // 2, num_node_classes),
         )
 
     def forward(self, x, pos, batch, x_faser):
@@ -1180,32 +1165,15 @@ class NeutrinoGravNetNodesFaser(nn.Module):
         global_mean = global_mean_pool(x, batch)  # [batch_size, input_dim + 3]
         x = torch.cat([x, global_mean[batch]], dim=-1)  # [N, 2*(input_dim + 3)]
 
-        # List to hold outputs from each GravNet block
+        # GravNet stacks
         feat = []
-
-        # GravNet stack 1
-        x = F.elu(self.ft1_1(x))
-        x = F.elu(self.ft1_2(x))
-        x = torch.tanh(self.ft1_3(x))
-        x = self.gn1(x, batch)
-        x = self.bn1(x)
-        feat.append(x)
-
-        # GravNet stack 2
-        x = F.elu(self.ft2_1(x))
-        x = F.elu(self.ft2_2(x))
-        x = torch.tanh(self.ft2_3(x))
-        x = self.gn2(x, batch)
-        x = self.bn2(x)
-        feat.append(x)
-
-        # GravNet stack 3
-        x = F.elu(self.ft3_1(x))
-        x = F.elu(self.ft3_2(x))
-        x = torch.tanh(self.ft3_3(x))
-        x = self.gn3(x, batch)
-        x = self.bn3(x)
-        feat.append(x)
+        for fts, gn, bn in zip(self.fts, self.gns, self.bns):
+            x = F.elu(fts[0](x))
+            x = F.elu(fts[1](x))
+            x = torch.tanh(fts[2](x))
+            x = gn(x, batch)
+            x = bn(x)
+            feat.append(x)
 
         # Concatenate all GravNet block outputs
         x = torch.cat(feat, dim=1)  # [N, n_gravstack * out_channels]

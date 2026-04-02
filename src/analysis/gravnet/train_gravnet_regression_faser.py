@@ -15,6 +15,7 @@ import argparse
 import datetime
 import logging
 import sys
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -109,7 +110,7 @@ def compute_loss(pred, target, loss_fn, huber_delta=1.0):
     return F.mse_loss(pred, target)
 
 
-def train_epoch(model, loader, optimizer, device, norm_stats, loss_fn="mse", huber_delta=1.0, scaler=None, fp16=False):
+def train_epoch(model, loader, optimizer, device, norm_stats, loss_fn="mse", huber_delta=1.0, accumulation_steps=1):
     """Train for one epoch."""
     model.train()
     total_loss = 0
@@ -119,34 +120,32 @@ def train_epoch(model, loader, optimizer, device, norm_stats, loss_fn="mse", hub
     all_targets = []
 
     train_bar = tqdm(loader, desc="Training", disable=not sys.stdout.isatty())
+    optimizer.zero_grad()
     for batch_idx, data in enumerate(train_bar):
         data = data.to(device)
-        optimizer.zero_grad()
 
         try:
-            with torch.cuda.amp.autocast(enabled=fp16):
-                predictions = model(data.x, data.pos, data.batch, data.x_faser)
-                targets = compute_targets(data, norm_stats)
+            predictions = model(data.x, data.pos, data.batch, data.x_faser)
+            targets = compute_targets(data, norm_stats)
 
-                loss = (compute_loss(predictions[:, 0], targets[:, 0], loss_fn, huber_delta) +
-                        compute_loss(predictions[:, 1], targets[:, 1], loss_fn, huber_delta))
+            loss = (compute_loss(predictions[:, 0], targets[:, 0], loss_fn, huber_delta) +
+                    compute_loss(predictions[:, 1], targets[:, 1], loss_fn, huber_delta)) / accumulation_steps
 
         except RuntimeError as e:
             print(f"\nSkipping batch {batch_idx} due to error: {e}")
             continue
 
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
+        loss.backward()
 
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-        if grad_norm > 50.0:
-            logger.warning(f"Large gradient norm: {grad_norm:.2f}")
-
-        scaler.step(optimizer)
-        scaler.update()
+        if (batch_idx + 1) % accumulation_steps == 0:
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            if grad_norm > 50.0:
+                logger.warning(f"Large gradient norm: {grad_norm:.2f}")
+            optimizer.step()
+            optimizer.zero_grad()
 
         batch_size = predictions.size(0)
-        total_loss += loss.item() * batch_size
+        total_loss += loss.item() * accumulation_steps * batch_size
         total_events += batch_size
 
         all_preds.append(predictions.detach())
@@ -157,6 +156,12 @@ def train_epoch(model, loader, optimizer, device, norm_stats, loss_fn="mse", hub
 
         if not sys.stdout.isatty() and (batch_idx + 1) % 100 == 0:
             logger.info(f"Batch {batch_idx + 1}: Loss={current_loss:.4f}")
+
+    # Handle trailing batches when len(loader) is not divisible by accumulation_steps
+    if (batch_idx + 1) % accumulation_steps != 0:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+        optimizer.step()
+        optimizer.zero_grad()
 
     avg_loss = total_loss / total_events
     all_preds = torch.cat(all_preds)
@@ -175,7 +180,7 @@ def train_epoch(model, loader, optimizer, device, norm_stats, loss_fn="mse", hub
     return avg_loss, rmse.item(), mean_rel_err.cpu(), std_rel_err.cpu()
 
 
-def validate_epoch(model, loader, device, norm_stats, loss_fn="mse", huber_delta=1.0, fp16=False):
+def validate_epoch(model, loader, device, norm_stats, loss_fn="mse", huber_delta=1.0):
     """Validate for one epoch."""
     model.eval()
     total_loss = 0
@@ -190,9 +195,8 @@ def validate_epoch(model, loader, device, norm_stats, loss_fn="mse", huber_delta
             data = data.to(device)
 
             try:
-                with torch.cuda.amp.autocast(enabled=fp16):
-                    predictions = model(data.x, data.pos, data.batch, data.x_faser)
-                    targets = compute_targets(data, norm_stats)
+                predictions = model(data.x, data.pos, data.batch, data.x_faser)
+                targets = compute_targets(data, norm_stats)
 
                 loss = (compute_loss(predictions[:, 0], targets[:, 0], loss_fn, huber_delta) +
                         compute_loss(predictions[:, 1], targets[:, 1], loss_fn, huber_delta))
@@ -288,10 +292,10 @@ def main():
         help="Delta parameter for Huber loss (default: 1.0)",
     )
     parser.add_argument(
-        "--fp16",
-        action="store_true",
-        default=False,
-        help="Use mixed precision training (torch.cuda.amp)",
+        "--accumulation-steps",
+        type=int,
+        default=1,
+        help="Gradient accumulation steps. Effective batch = batch_size × steps (default: 1, no accumulation).",
     )
     parser.add_argument(
         "--bin-size",
@@ -354,8 +358,6 @@ def main():
         suffix += "_faserglobal"
     if args.particle_prob:
         suffix += "_prob"
-    if args.fp16:
-        suffix += "_fp16"
     if args.bin_size != "200um":
         suffix += f"_{args.bin_size}"
     if args.suffix:
@@ -363,11 +365,14 @@ def main():
 
     # Setup paths
     torch_path = get_torch_path()
-    weights_path = get_weights_path() / f"gravnet_regression_faser_{suffix}"
-    if weights_path.exists() and not args.resume:
-        stamp = datetime.datetime.now().strftime("%m%d_%H%M")
-        weights_path = weights_path.parent / f"{weights_path.name}_{stamp}"
-        logger.warning(f"Output directory already exists — writing to {weights_path}")
+    if args.resume:
+        weights_path = Path(args.resume).parent
+    else:
+        weights_path = get_weights_path() / f"gravnet_regression_faser_{suffix}"
+        if weights_path.exists():
+            stamp = datetime.datetime.now().strftime("%m%d_%H%M")
+            weights_path = weights_path.parent / f"{weights_path.name}_{stamp}"
+            logger.warning(f"Output directory already exists — writing to {weights_path}")
     weights_path.mkdir(parents=True, exist_ok=True)
 
     # Add file handler to logger (append if resuming, overwrite if fresh run)
@@ -508,8 +513,6 @@ def main():
     scheduler = ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=10, verbose=True
     )
-    scaler = torch.cuda.amp.GradScaler(enabled=args.fp16)
-
     # Training loop
     best_val_loss = float("inf")
     best_epoch = 0
@@ -555,12 +558,11 @@ def main():
     for epoch in range(start_epoch, args.num_epochs):
         train_loss, train_rmse, train_rel_err, train_resolution = train_epoch(
             model, train_loader, optimizer, device, norm_stats, args.loss, args.huber_delta,
-            scaler=scaler, fp16=args.fp16,
+            accumulation_steps=args.accumulation_steps,
         )
 
         val_loss, val_rmse, val_rel_err, val_resolution = validate_epoch(
             model, val_loader, device, norm_stats, args.loss, args.huber_delta,
-            fp16=args.fp16,
         )
 
         scheduler.step(val_loss)
@@ -600,7 +602,7 @@ def main():
             "parametrisation": "reparam_std",
             "loss_fn": args.loss,
             "huber_delta": args.huber_delta,
-            "fp16": args.fp16,
+            "accumulation_steps": args.accumulation_steps,
             "bin_size": args.bin_size,
         }
 

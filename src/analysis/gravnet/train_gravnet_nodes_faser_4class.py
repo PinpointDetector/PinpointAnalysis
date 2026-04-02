@@ -14,13 +14,17 @@ Usage:
 import argparse
 import datetime
 import logging
+import sys
+from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+from sklearn.metrics import precision_recall_fscore_support
 from sklearn.model_selection import train_test_split
 from torch.optim import Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 
@@ -62,16 +66,16 @@ def compute_class_weights(dataset, num_classes):
     return weights
 
 
-def train_epoch(model, loader, optimizer, device, node_class_weights):
-    """Train for one epoch."""
+def train_epoch(model, loader, optimizer, device, node_class_weights, accumulation_steps=1):
+    """Train for one epoch with optional gradient accumulation."""
     model.train()
     total_loss = 0
     node_correct = 0
     node_total = 0
 
+    optimizer.zero_grad()
     for batch_idx, data in enumerate(tqdm(loader, desc="Training")):
         data = data.to(device)
-        optimizer.zero_grad()
         try:
             node_out = model(data.x, data.pos, data.batch, data.x_faser)
             node_loss = F.cross_entropy(node_out, data.pdg_label, weight=node_class_weights)
@@ -82,10 +86,18 @@ def train_epoch(model, loader, optimizer, device, node_class_weights):
             logger.warning(f"Skipping batch {batch_idx}: {e}")
             continue
 
-        node_loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-        optimizer.step()
+        (node_loss / accumulation_steps).backward()
+        if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == len(loader):
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            optimizer.step()
+            optimizer.zero_grad()
+
         total_loss += node_loss.item() * data.num_nodes
+
+        if not sys.stdout.isatty() and (batch_idx + 1) % 100 == 0:
+            current_loss = total_loss / node_total if node_total > 0 else 0.0
+            current_acc = node_correct / node_total if node_total > 0 else 0.0
+            logger.info(f"Batch {batch_idx + 1}/{len(loader)}: Loss={current_loss:.4f}, Acc={current_acc:.4f}")
 
     avg_loss = total_loss / node_total if node_total > 0 else 0.0
     node_acc = node_correct / node_total if node_total > 0 else 0.0
@@ -129,15 +141,24 @@ def validate_epoch(model, loader, device, node_class_weights):
     node_acc = node_correct / node_total if node_total > 0 else 0.0
     node_wacc = node_weighted_correct / node_weighted_total if node_weighted_total > 0 else 0.0
 
-    per_class_acc = []
+    per_class_acc = np.zeros(NUM_NODE_CLASSES)
+    per_class_precision = np.zeros(NUM_NODE_CLASSES)
+    per_class_recall = np.zeros(NUM_NODE_CLASSES)
+    per_class_f1 = np.zeros(NUM_NODE_CLASSES)
     if len(all_preds) > 0:
         all_preds = np.array(all_preds)
         all_targets = np.array(all_targets)
         for i in range(NUM_NODE_CLASSES):
             mask = all_targets == i
-            per_class_acc.append((all_preds[mask] == i).mean() if mask.sum() > 0 else 0.0)
+            per_class_acc[i] = (all_preds[mask] == i).mean() if mask.sum() > 0 else 0.0
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            all_targets, all_preds, labels=list(range(NUM_NODE_CLASSES)), zero_division=0
+        )
+        per_class_precision = precision
+        per_class_recall = recall
+        per_class_f1 = f1
 
-    return avg_loss, node_acc, node_wacc, per_class_acc
+    return avg_loss, node_acc, node_wacc, per_class_acc, per_class_precision, per_class_recall, per_class_f1
 
 
 def main():
@@ -171,15 +192,29 @@ def main():
         "--resume", type=str, default=None, metavar="CHECKPOINT",
         help="Path to checkpoint .pt file to resume training from",
     )
+    # Model hyperparameters
+    parser.add_argument("--n-gravstack",         type=int, default=3,
+        help="Number of GravNet blocks (default: 3)")
+    parser.add_argument("--out-channels",        type=int, default=16,
+        help="Output channels per GravNet block (default: 16)")
+    parser.add_argument("--n-feature-transform", type=int, default=16,
+        help="Hidden dim for feature transform MLPs (default: 16)")
+    parser.add_argument("--k",                   type=int, default=12,
+        help="k-nearest neighbours for GravNet (default: 12)")
+    parser.add_argument("--accumulation-steps",  type=int, default=1,
+        help="Gradient accumulation steps. Effective batch = batch_size x accumulation_steps (default: 1)")
     args = parser.parse_args()
 
     # ── Paths ─────────────────────────────────────────────────────────────────
     torch_path   = get_torch_path()
-    weights_path = get_weights_path() / "gravnet_nodes_faser_all_events_4class"
-    if weights_path.exists() and not args.resume:
-        stamp = datetime.datetime.now().strftime("%m%d_%H%M")
-        weights_path = weights_path.parent / f"{weights_path.name}_{stamp}"
-        logger.warning(f"Output dir exists — writing to {weights_path}")
+    if args.resume:
+        weights_path = Path(args.resume).parent
+    else:
+        weights_path = get_weights_path() / "gravnet_nodes_faser_all_events_4class"
+        if weights_path.exists():
+            stamp = datetime.datetime.now().strftime("%m%d_%H%M")
+            weights_path = weights_path.parent / f"{weights_path.name}_{stamp}"
+            logger.warning(f"Output dir exists — writing to {weights_path}")
     weights_path.mkdir(parents=True, exist_ok=True)
 
     # ── Logging to file ───────────────────────────────────────────────────────
@@ -257,8 +292,17 @@ def main():
         input_dim=sample.x.shape[1],
         num_node_classes=NUM_NODE_CLASSES,
         faser_dim=sample.x_faser.shape[0],
+        n_gravstack=args.n_gravstack,
+        out_channels=args.out_channels,
+        n_feature_transform=args.n_feature_transform,
+        k=args.k,
     ).to(device)
-    logger.info(f"Parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(f"Parameters: {n_params:,}")
+    logger.info(f"Model config: n_gravstack={args.n_gravstack}, out_channels={args.out_channels}, "
+                f"n_feature_transform={args.n_feature_transform}, k={args.k}")
+    logger.info(f"Gradient accumulation steps: {args.accumulation_steps} "
+                f"(effective batch = {args.batch_size * args.accumulation_steps})")
 
     # ── Optimiser ─────────────────────────────────────────────────────────────
     optimizer = Adam(model.parameters(), lr=1e-4, weight_decay=1e-5)
@@ -278,13 +322,17 @@ def main():
         logger.info(f"Resumed from epoch {start_epoch} (val_loss={best_val_loss:.4f})")
 
     # ── Training loop ─────────────────────────────────────────────────────────
-    metrics = {k: [] for k in ["train_loss", "train_acc", "val_loss", "val_acc", "val_wacc"]}
+    metrics = {k: [] for k in [
+        "train_loss", "train_acc", "val_loss", "val_acc", "val_wacc",
+        "val_per_class_acc", "val_per_class_f1", "val_per_class_precision", "val_per_class_recall",
+    ]}
 
     for epoch in range(start_epoch, args.num_epochs):
         train_loss, train_acc = train_epoch(
-            model, train_loader, optimizer, device, node_class_weights
+            model, train_loader, optimizer, device, node_class_weights,
+            accumulation_steps=args.accumulation_steps,
         )
-        val_loss, val_acc, val_wacc, val_per_class = validate_epoch(
+        val_loss, val_acc, val_wacc, val_per_class, val_precision, val_recall, val_f1 = validate_epoch(
             model, val_loader, device, node_class_weights
         )
         scheduler.step(val_loss)
@@ -294,14 +342,18 @@ def main():
         metrics["val_loss"].append(val_loss)
         metrics["val_acc"].append(val_acc)
         metrics["val_wacc"].append(val_wacc)
+        metrics["val_per_class_acc"].append(val_per_class)
+        metrics["val_per_class_f1"].append(val_f1)
+        metrics["val_per_class_precision"].append(val_precision)
+        metrics["val_per_class_recall"].append(val_recall)
 
         logger.info(
             f"Epoch {epoch+1}/{args.num_epochs}  "
             f"train_loss={train_loss:.4f} acc={train_acc:.4f}  "
             f"val_loss={val_loss:.4f} acc={val_acc:.4f} wacc={val_wacc:.4f}"
         )
-        for name, acc in zip(CLASS_NAMES, val_per_class):
-            logger.info(f"  {name}: {acc*100:.1f}%")
+        for name, acc, f1 in zip(CLASS_NAMES, val_per_class, val_f1):
+            logger.info(f"  {name}: acc={acc*100:.1f}%  f1={f1:.3f}")
 
         # Save latest checkpoint every epoch (enables resume)
         ckpt = {
@@ -312,6 +364,12 @@ def main():
             "val_acc":              val_acc,
             "num_node_classes":     NUM_NODE_CLASSES,
             "class_names":          CLASS_NAMES,
+            "model_config": {
+                "n_gravstack":         args.n_gravstack,
+                "out_channels":        args.out_channels,
+                "n_feature_transform": args.n_feature_transform,
+                "k":                   args.k,
+            },
         }
         torch.save(ckpt, weights_path / "latest_checkpoint.pt")
 
