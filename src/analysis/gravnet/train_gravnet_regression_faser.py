@@ -2,9 +2,9 @@
 """
 Training script for NeutrinoGravNetRegressionFASER model.
 
-Predicts log10(E_nu) and logit(y) where y = E_lepton / E_nu (lepton energy fraction).
-Note: this is 1 - y_Bjorken (Bjorken inelasticity = E_roe/E_nu = hadronic energy fraction).
-E_lepton and E_roe are derived at inference as y·E_nu and (1-y)·E_nu, so energy
+Predicts log10(E_nu) and logit(y) where y = E_roe / E_nu (Bjorken inelasticity = hadronic energy fraction).
+Note: this is 1 - lepton fraction (lepton fraction = E_lepton/E_nu).
+E_roe and E_lepton are derived at inference as y·E_nu and (1-y)·E_nu, so energy
 conservation E_lepton + E_roe = E_nu holds exactly by construction.
 
 Usage:
@@ -59,13 +59,13 @@ def compute_targets(data, norm_stats):
 
     Returns targets [batch_size, 2]:
         col 0: (log10(E_nu) - mu_enu) / sigma_enu
-        col 1: (logit(y) - mu_logit) / sigma_logit   where y = E_lepton / E_nu  (lepton fraction = 1 - y_Bjorken)
+        col 1: (logit(y) - mu_logit) / sigma_logit   where y = E_roe / E_nu  (Bjorken inelasticity = 1 - lepton fraction)
     """
     E_nu = data.E_nu.clamp(min=1e-6)
     E_lepton = data.E_lepton.clamp(min=1e-6)
     E_roe = data.E_roe.clamp(min=1e-6)
     log_E_nu = torch.log10(E_nu)
-    logit_y = torch.log(E_lepton / E_roe)
+    logit_y = torch.log(E_roe / E_lepton)   # logit of inelasticity y = E_roe/E_nu
     log_E_nu_std = (log_E_nu - norm_stats["mu_enu"]) / norm_stats["sigma_enu"]
     logit_y_std  = (logit_y  - norm_stats["mu_logit"]) / norm_stats["sigma_logit"]
     return torch.stack([log_E_nu_std, logit_y_std], dim=1)  # [batch_size, 2]
@@ -76,7 +76,7 @@ def preds_to_physical(preds, targets, norm_stats):
     Convert standardised model outputs and targets to physical energies.
 
     Args:
-        preds:      [N, 2] — standardised (log10_E_nu, logit_y)
+        preds:      [N, 2] — standardised (log10_E_nu, logit_y) where y = E_roe/E_nu (inelasticity)
         targets:    [N, 2] — standardised (log10_E_nu, logit_y)
         norm_stats: dict with mu_enu, sigma_enu, mu_logit, sigma_logit
 
@@ -90,14 +90,14 @@ def preds_to_physical(preds, targets, norm_stats):
     logit_y_true  = targets[:, 1] * norm_stats["sigma_logit"] + norm_stats["mu_logit"]
 
     E_nu_pred = 10 ** log_E_nu_pred
-    y_pred = torch.sigmoid(logit_y_pred)
-    E_lepton_pred = y_pred * E_nu_pred
-    E_roe_pred = (1 - y_pred) * E_nu_pred
+    y_pred = torch.sigmoid(logit_y_pred)        # y = inelasticity = E_roe/E_nu
+    E_roe_pred    = y_pred * E_nu_pred
+    E_lepton_pred = (1 - y_pred) * E_nu_pred
 
     E_nu_true = 10 ** log_E_nu_true
     y_true = torch.sigmoid(logit_y_true)
-    E_lepton_true = y_true * E_nu_true
-    E_roe_true = (1 - y_true) * E_nu_true
+    E_roe_true    = y_true * E_nu_true
+    E_lepton_true = (1 - y_true) * E_nu_true
 
     preds_linear = torch.stack([E_nu_pred, E_lepton_pred, E_roe_pred], dim=1)
     targets_linear = torch.stack([E_nu_true, E_lepton_true, E_roe_true], dim=1)
@@ -464,7 +464,7 @@ def main():
         [torch.log10(d.E_nu.clamp(1e-6)) for d in train_dataset]
     )
     logit_y_vals = torch.stack(
-        [torch.log(d.E_lepton.clamp(1e-6) / d.E_roe.clamp(1e-6))
+        [torch.log(d.E_roe.clamp(1e-6) / d.E_lepton.clamp(1e-6))
          for d in train_dataset]
     )
     norm_stats = {
@@ -494,7 +494,7 @@ def main():
         shuffle=False,
     )
 
-    # Create model (2 outputs: log10 E_nu, logit y)
+    # Create model (2 outputs: log10 E_nu, logit y where y = E_roe/E_nu = Bjorken inelasticity)
     model = NeutrinoGravNetRegressionFASER(
         input_dim=sample.x.shape[1],
         num_targets=2,
