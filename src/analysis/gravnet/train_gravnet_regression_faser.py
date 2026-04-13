@@ -71,31 +71,38 @@ def compute_targets(data, norm_stats):
     return torch.stack([log_E_nu_std, logit_y_std], dim=1)  # [batch_size, 2]
 
 
-def preds_to_physical(preds, targets, norm_stats):
+def preds_to_physical(preds, targets, norm_stats, beta_loss=False):
     """
     Convert standardised model outputs and targets to physical energies.
 
     Args:
-        preds:      [N, 2] — standardised (log10_E_nu, logit_y) where y = E_roe/E_nu (inelasticity)
+        preds:      [N, 2] or [N, 3] — when beta_loss=False: (t1_std, t2_std);
+                    when beta_loss=True: (t1_std, alpha, beta) with alpha/beta already softplus-activated
         targets:    [N, 2] — standardised (log10_E_nu, logit_y)
         norm_stats: dict with mu_enu, sigma_enu, mu_logit, sigma_logit
+        beta_loss:  If True, recover y_pred as Beta distribution mean alpha/(alpha+beta)
 
     Returns:
         preds_linear, targets_linear: both [N, 3] — (E_nu, E_lepton, E_roe) in TeV
     """
-    # Destandardise back to reparam space
+    # Destandardise t1 (common to both modes)
     log_E_nu_pred = preds[:, 0] * norm_stats["sigma_enu"]   + norm_stats["mu_enu"]
-    logit_y_pred  = preds[:, 1] * norm_stats["sigma_logit"] + norm_stats["mu_logit"]
     log_E_nu_true = targets[:, 0] * norm_stats["sigma_enu"]   + norm_stats["mu_enu"]
     logit_y_true  = targets[:, 1] * norm_stats["sigma_logit"] + norm_stats["mu_logit"]
 
     E_nu_pred = 10 ** log_E_nu_pred
-    y_pred = torch.sigmoid(logit_y_pred)        # y = inelasticity = E_roe/E_nu
+    E_nu_true = 10 ** log_E_nu_true
+
+    if beta_loss:
+        alpha, beta_p = preds[:, 1], preds[:, 2]
+        y_pred = alpha / (alpha + beta_p)              # E[Beta(α,β)] ∈ (0,1)
+    else:
+        logit_y_pred = preds[:, 1] * norm_stats["sigma_logit"] + norm_stats["mu_logit"]
+        y_pred = torch.sigmoid(logit_y_pred)           # y = inelasticity = E_roe/E_nu
+
+    y_true = torch.sigmoid(logit_y_true)
     E_roe_pred    = y_pred * E_nu_pred
     E_lepton_pred = (1 - y_pred) * E_nu_pred
-
-    E_nu_true = 10 ** log_E_nu_true
-    y_true = torch.sigmoid(logit_y_true)
     E_roe_true    = y_true * E_nu_true
     E_lepton_true = (1 - y_true) * E_nu_true
 
@@ -110,10 +117,17 @@ def compute_loss(pred, target, loss_fn, huber_delta=1.0):
     return F.mse_loss(pred, target)
 
 
-def train_epoch(model, loader, optimizer, device, norm_stats, loss_fn="mse", huber_delta=1.0, accumulation_steps=1):
+def compute_beta_loss(alpha, beta_param, y_true):
+    """NLL of y_true under Beta(alpha, beta_param). y_true must be in (0,1)."""
+    return -torch.distributions.Beta(alpha, beta_param).log_prob(y_true).mean()
+
+
+def train_epoch(model, loader, optimizer, device, norm_stats, loss_fn="mse", huber_delta=1.0, accumulation_steps=1, beta_loss=False):
     """Train for one epoch."""
     model.train()
     total_loss = 0
+    total_loss_t1 = 0
+    total_loss_t2 = 0
     total_events = 0
 
     all_preds = []
@@ -128,8 +142,15 @@ def train_epoch(model, loader, optimizer, device, norm_stats, loss_fn="mse", hub
             predictions = model(data.x, data.pos, data.batch, data.x_faser)
             targets = compute_targets(data, norm_stats)
 
-            loss = (compute_loss(predictions[:, 0], targets[:, 0], loss_fn, huber_delta) +
-                    compute_loss(predictions[:, 1], targets[:, 1], loss_fn, huber_delta)) / accumulation_steps
+            loss_t1 = compute_loss(predictions[:, 0], targets[:, 0], loss_fn, huber_delta)
+            if beta_loss:
+                y_true_frac = torch.sigmoid(
+                    targets[:, 1] * norm_stats["sigma_logit"] + norm_stats["mu_logit"]
+                ).clamp(1e-6, 1 - 1e-6)
+                loss_t2 = compute_beta_loss(predictions[:, 1], predictions[:, 2], y_true_frac)
+            else:
+                loss_t2 = compute_loss(predictions[:, 1], targets[:, 1], loss_fn, huber_delta)
+            loss = (loss_t1 + loss_t2) / accumulation_steps
 
         except RuntimeError as e:
             print(f"\nSkipping batch {batch_idx} due to error: {e}")
@@ -145,7 +166,9 @@ def train_epoch(model, loader, optimizer, device, norm_stats, loss_fn="mse", hub
             optimizer.zero_grad()
 
         batch_size = predictions.size(0)
-        total_loss += loss.item() * accumulation_steps * batch_size
+        total_loss_t1 += loss_t1.item() * batch_size
+        total_loss_t2 += loss_t2.item() * batch_size
+        total_loss += (loss_t1.item() + loss_t2.item()) * batch_size
         total_events += batch_size
 
         all_preds.append(predictions.detach())
@@ -164,26 +187,32 @@ def train_epoch(model, loader, optimizer, device, norm_stats, loss_fn="mse", hub
         optimizer.zero_grad()
 
     avg_loss = total_loss / total_events
+    avg_loss_t1 = total_loss_t1 / total_events
+    avg_loss_t2 = total_loss_t2 / total_events
     all_preds = torch.cat(all_preds)
     all_targets = torch.cat(all_targets)
 
-    if loss_fn == "mse":
+    if beta_loss:
+        rmse = torch.sqrt(F.mse_loss(all_preds[:, 0], all_targets[:, 0]))
+    elif loss_fn == "mse":
         rmse = torch.sqrt(torch.tensor(avg_loss))
     else:
         rmse = torch.sqrt(F.mse_loss(all_preds, all_targets))
 
-    preds_linear, targets_linear = preds_to_physical(all_preds, all_targets, norm_stats)
+    preds_linear, targets_linear = preds_to_physical(all_preds, all_targets, norm_stats, beta_loss=beta_loss)
     rel_err = torch.abs(preds_linear - targets_linear) / targets_linear.clamp(min=1e-6)
     mean_rel_err = rel_err.mean(dim=0)  # [3]
     std_rel_err = rel_err.std(dim=0)    # [3]
 
-    return avg_loss, rmse.item(), mean_rel_err.cpu(), std_rel_err.cpu()
+    return avg_loss, avg_loss_t1, avg_loss_t2, rmse.item(), mean_rel_err.cpu(), std_rel_err.cpu()
 
 
-def validate_epoch(model, loader, device, norm_stats, loss_fn="mse", huber_delta=1.0):
+def validate_epoch(model, loader, device, norm_stats, loss_fn="mse", huber_delta=1.0, beta_loss=False):
     """Validate for one epoch."""
     model.eval()
     total_loss = 0
+    total_loss_t1 = 0
+    total_loss_t2 = 0
     total_events = 0
 
     all_preds = []
@@ -198,11 +227,19 @@ def validate_epoch(model, loader, device, norm_stats, loss_fn="mse", huber_delta
                 predictions = model(data.x, data.pos, data.batch, data.x_faser)
                 targets = compute_targets(data, norm_stats)
 
-                loss = (compute_loss(predictions[:, 0], targets[:, 0], loss_fn, huber_delta) +
-                        compute_loss(predictions[:, 1], targets[:, 1], loss_fn, huber_delta))
+                loss_t1 = compute_loss(predictions[:, 0], targets[:, 0], loss_fn, huber_delta)
+                if beta_loss:
+                    y_true_frac = torch.sigmoid(
+                        targets[:, 1] * norm_stats["sigma_logit"] + norm_stats["mu_logit"]
+                    ).clamp(1e-6, 1 - 1e-6)
+                    loss_t2 = compute_beta_loss(predictions[:, 1], predictions[:, 2], y_true_frac)
+                else:
+                    loss_t2 = compute_loss(predictions[:, 1], targets[:, 1], loss_fn, huber_delta)
 
                 batch_size = predictions.size(0)
-                total_loss += loss.item() * batch_size
+                total_loss_t1 += loss_t1.item() * batch_size
+                total_loss_t2 += loss_t2.item() * batch_size
+                total_loss += (loss_t1.item() + loss_t2.item()) * batch_size
                 total_events += batch_size
 
                 all_preds.append(predictions)
@@ -215,20 +252,24 @@ def validate_epoch(model, loader, device, norm_stats, loss_fn="mse", huber_delta
                 continue
 
     avg_loss = total_loss / total_events
+    avg_loss_t1 = total_loss_t1 / total_events
+    avg_loss_t2 = total_loss_t2 / total_events
     all_preds = torch.cat(all_preds)
     all_targets = torch.cat(all_targets)
 
-    if loss_fn == "mse":
+    if beta_loss:
+        rmse = torch.sqrt(F.mse_loss(all_preds[:, 0], all_targets[:, 0]))
+    elif loss_fn == "mse":
         rmse = torch.sqrt(torch.tensor(avg_loss))
     else:
         rmse = torch.sqrt(F.mse_loss(all_preds, all_targets))
 
-    preds_linear, targets_linear = preds_to_physical(all_preds, all_targets, norm_stats)
+    preds_linear, targets_linear = preds_to_physical(all_preds, all_targets, norm_stats, beta_loss=beta_loss)
     rel_err = torch.abs(preds_linear - targets_linear) / targets_linear.clamp(min=1e-6)
     mean_rel_err = rel_err.mean(dim=0)
     std_rel_err = rel_err.std(dim=0)
 
-    return avg_loss, rmse.item(), mean_rel_err.cpu(), std_rel_err.cpu()
+    return avg_loss, avg_loss_t1, avg_loss_t2, rmse.item(), mean_rel_err.cpu(), std_rel_err.cpu()
 
 
 def main():
@@ -334,6 +375,12 @@ def main():
         default=False,
         help="Load *_particle_prob.pt files (data.x augmented with 4-class node softmax probs).",
     )
+    parser.add_argument(
+        "--beta-loss",
+        action="store_true",
+        default=False,
+        help="Replace MSE on t2=logit(y) with Beta NLL (outputs alpha, beta per event).",
+    )
     args = parser.parse_args()
 
     # Print all arguments
@@ -344,31 +391,38 @@ def main():
         logger.info(f"  {arg}: {value}")
     logger.info("=" * 80)
 
-    # Build output directory suffix
-    suffix = f"{args.data_type}_events_{args.pooling}_reparam_std"
+    # Build output directory name from varying flags only.
+    # Fixed choices (reparam+std normalisation, all-events, pooling) are omitted
+    # since they no longer differentiate runs.
+    parts = []
     if args.loss != "mse":
-        suffix += f"_{args.loss}"
-        if args.loss == "huber":
-            suffix += f"{args.huber_delta}"
+        loss_str = args.loss + (str(args.huber_delta) if args.loss == "huber" else "")
+        parts.append(loss_str)
     if args.truth_label:
-        suffix += "_truth3"
+        parts.append("truth3")
     if args.truth_label_4:
-        suffix += "_truth4"
+        parts.append("truth4")
     if args.faser_global:
-        suffix += "_faserglobal"
+        parts.append("faserglobal")
     if args.particle_prob:
-        suffix += "_prob"
+        parts.append("prob")
+    if args.beta_loss:
+        parts.append("beta")
     if args.bin_size != "200um":
-        suffix += f"_{args.bin_size}"
+        parts.append(args.bin_size)
     if args.suffix:
-        suffix += f"_{args.suffix}"
+        parts.append(args.suffix)
+
+    dir_name = "gravnet_regression_faser"
+    if parts:
+        dir_name += "_" + "_".join(parts)
 
     # Setup paths
     torch_path = get_torch_path()
     if args.resume:
         weights_path = Path(args.resume).parent
     else:
-        weights_path = get_weights_path() / f"gravnet_regression_faser_{suffix}"
+        weights_path = get_weights_path() / dir_name
         if weights_path.exists():
             stamp = datetime.datetime.now().strftime("%m%d_%H%M")
             weights_path = weights_path.parent / f"{weights_path.name}_{stamp}"
@@ -495,12 +549,14 @@ def main():
     )
 
     # Create model (2 outputs: log10 E_nu, logit y where y = E_roe/E_nu = Bjorken inelasticity)
+    # beta_loss=True: 3 outputs (t1, alpha, beta) with softplus on alpha/beta
     model = NeutrinoGravNetRegressionFASER(
         input_dim=sample.x.shape[1],
         num_targets=2,
         faser_dim=sample.x_faser.shape[0],
         pooling=args.pooling,
         dropout=0.2,
+        beta_loss=args.beta_loss,
     ).to(device)
 
     logger.info(f"Model: {model}")
@@ -519,8 +575,12 @@ def main():
 
     metrics = {
         "train_loss": [],
+        "train_loss_t1": [],
+        "train_loss_t2": [],
         "train_rmse": [],
         "val_loss": [],
+        "val_loss_t1": [],
+        "val_loss_t2": [],
         "val_rmse": [],
         "train_rel_err": [],   # [epochs, 3] — E_nu, E_lepton, E_roe in physical space
         "val_rel_err": [],
@@ -556,20 +616,25 @@ def main():
         )
 
     for epoch in range(start_epoch, args.num_epochs):
-        train_loss, train_rmse, train_rel_err, train_resolution = train_epoch(
+        train_loss, train_loss_t1, train_loss_t2, train_rmse, train_rel_err, train_resolution = train_epoch(
             model, train_loader, optimizer, device, norm_stats, args.loss, args.huber_delta,
-            accumulation_steps=args.accumulation_steps,
+            accumulation_steps=args.accumulation_steps, beta_loss=args.beta_loss,
         )
 
-        val_loss, val_rmse, val_rel_err, val_resolution = validate_epoch(
+        val_loss, val_loss_t1, val_loss_t2, val_rmse, val_rel_err, val_resolution = validate_epoch(
             model, val_loader, device, norm_stats, args.loss, args.huber_delta,
+            beta_loss=args.beta_loss,
         )
 
         scheduler.step(val_loss)
 
         metrics["train_loss"].append(train_loss)
+        metrics["train_loss_t1"].append(train_loss_t1)
+        metrics["train_loss_t2"].append(train_loss_t2)
         metrics["train_rmse"].append(train_rmse)
         metrics["val_loss"].append(val_loss)
+        metrics["val_loss_t1"].append(val_loss_t1)
+        metrics["val_loss_t2"].append(val_loss_t2)
         metrics["val_rmse"].append(val_rmse)
         metrics["train_rel_err"].append(train_rel_err.numpy())
         metrics["val_rel_err"].append(val_rel_err.numpy())
@@ -582,8 +647,8 @@ def main():
         )
         logger.info(
             f"Epoch {epoch + 1}/{args.num_epochs} - "
-            f"Train Loss: {train_loss:.4f}, RMSE: {train_rmse:.4f} - "
-            f"Val Loss: {val_loss:.4f}, RMSE: {val_rmse:.4f} - "
+            f"Train Loss: {train_loss:.4f} (t1={train_loss_t1:.4f}, t2={train_loss_t2:.4f}), RMSE: {train_rmse:.4f} - "
+            f"Val Loss: {val_loss:.4f} (t1={val_loss_t1:.4f}, t2={val_loss_t2:.4f}), RMSE: {val_rmse:.4f} - "
             f"Val RelErr: {rel_err_str}"
         )
 
@@ -593,6 +658,8 @@ def main():
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "val_loss": val_loss,
+            "val_loss_t1": val_loss_t1,
+            "val_loss_t2": val_loss_t2,
             "val_rmse": val_rmse,
             "val_rel_err": val_rel_err.numpy(),
             "val_resolution": val_resolution.numpy(),
@@ -604,6 +671,7 @@ def main():
             "huber_delta": args.huber_delta,
             "accumulation_steps": args.accumulation_steps,
             "bin_size": args.bin_size,
+            "beta_loss": args.beta_loss,
         }
 
         if val_loss < best_val_loss:

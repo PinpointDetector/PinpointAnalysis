@@ -1226,6 +1226,7 @@ class NeutrinoGravNetRegressionFASER(nn.Module):
         k: int = 12,
         n_gravstack: int = 3,
         batchnorm_momentum: float = 0.05,
+        beta_loss: bool = False,
     ):
         """
         Args:
@@ -1241,8 +1242,10 @@ class NeutrinoGravNetRegressionFASER(nn.Module):
             k: Number of nearest neighbors for aggregation
             n_gravstack: Number of GravNet blocks
             batchnorm_momentum: BatchNorm momentum
+            beta_loss: If True, output [t1, raw_alpha, raw_beta]; softplus applied to alpha/beta in forward
         """
         super().__init__()
+        self.beta_loss = beta_loss
 
         # Input will be [features, x, y, z] concatenated
         input_with_pos = input_dim + 3
@@ -1319,8 +1322,8 @@ class NeutrinoGravNetRegressionFASER(nn.Module):
             nn.Linear(32, 16),
             nn.SiLU(),
             nn.Dropout(dropout),
-            nn.Linear(16, num_targets),
-            # No final activation — raw values for MSE loss
+            nn.Linear(16, 3 if beta_loss else num_targets),
+            # No final activation — softplus applied to alpha/beta in forward when beta_loss=True
         )
 
     def forward(self, x, pos, batch, x_faser):
@@ -1388,4 +1391,8 @@ class NeutrinoGravNetRegressionFASER(nn.Module):
         x_combined = torch.cat([x_pooled, x_faser_processed], dim=1)
 
         # Regression prediction
-        return self.regression_head(x_combined)
+        out = self.regression_head(x_combined)
+        if self.beta_loss:
+            # out[:,0] = t1 (raw), out[:,1:] = raw_alpha/beta — apply softplus to keep > 0
+            out = torch.cat([out[:, :1], F.softplus(out[:, 1:])], dim=1)
+        return out
