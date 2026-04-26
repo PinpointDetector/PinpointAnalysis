@@ -26,7 +26,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 
-from analysis.gravnet.model import NeutrinoGravNetRegressionFASER
+from analysis.gravnet.model import NeutrinoGravNetNodesFaser, NeutrinoGravNetRegressionFASER
 from analysis.utils.utils import get_torch_path, get_weights_path
 
 # Setup logging
@@ -364,6 +364,18 @@ def main():
         help="Augment node features with one-hot raw pdg_label (4-class: other/secondary_e/primary_EM_e/mu)",
     )
     parser.add_argument(
+        "--truth-label-2",
+        action="store_true",
+        default=False,
+        help="Augment node features with binary truth label: primary_EM_e vs everything else (remap {0→0,1→0,2→1,3→0})",
+    )
+    parser.add_argument(
+        "--truth-label-3b",
+        action="store_true",
+        default=False,
+        help="Augment node features with physically-correct 3-class label: (other+mu) / secondary_e / primary_EM_e (remap {0→0,1→1,2→2,3→0})",
+    )
+    parser.add_argument(
         "--faser-global",
         action="store_true",
         default=False,
@@ -376,10 +388,41 @@ def main():
         help="Load *_particle_prob.pt files (data.x augmented with 4-class node softmax probs).",
     )
     parser.add_argument(
+        "--binary-prob-weights",
+        type=str,
+        default=None,
+        metavar="CHECKPOINT",
+        help="Path to binary classifier best_model.pt. Runs inference in-memory at startup, "
+             "appending [P(background), P(primary_EM_e)] to each node's features.",
+    )
+    parser.add_argument(
+        "--truth3b-prob-weights",
+        type=str,
+        default=None,
+        metavar="CHECKPOINT",
+        help="Path to truth3b (3-class) classifier best_model.pt. Runs inference in-memory, "
+             "appending [P(other_mu), P(secondary_e), P(primary_EM_e)] to each node's features.",
+    )
+    parser.add_argument(
+        "--classifier-embedding-weights",
+        type=str,
+        default=None,
+        metavar="CHECKPOINT",
+        help="Path to any classifier best_model.pt. Appends the full pre-classifier node "
+             "embedding [N, n_gravstack*out_channels+8] instead of softmax probs. "
+             "num_node_classes is read from the checkpoint automatically.",
+    )
+    parser.add_argument(
         "--beta-loss",
         action="store_true",
         default=False,
         help="Replace MSE on t2=logit(y) with Beta NLL (outputs alpha, beta per event).",
+    )
+    parser.add_argument(
+        "--no-faser-features",
+        action="store_true",
+        default=False,
+        help="Disable FASER spectrometer MLP branch (ablation study).",
     )
     args = parser.parse_args()
 
@@ -402,12 +445,24 @@ def main():
         parts.append("truth3")
     if args.truth_label_4:
         parts.append("truth4")
+    if args.truth_label_2:
+        parts.append("truth2")
+    if args.truth_label_3b:
+        parts.append("truth3b")
     if args.faser_global:
         parts.append("faserglobal")
     if args.particle_prob:
         parts.append("prob")
+    if args.binary_prob_weights:
+        parts.append("binaryprob")
+    if args.truth3b_prob_weights:
+        parts.append("truth3bprob")
+    if args.classifier_embedding_weights:
+        parts.append("embedding")
     if args.beta_loss:
         parts.append("beta")
+    if args.no_faser_features:
+        parts.append("nofaser")
     if args.bin_size != "200um":
         parts.append(args.bin_size)
     if args.suffix:
@@ -454,7 +509,8 @@ def main():
 
         if args.chunks is None:
             chunk_files = sorted(run_path.glob(f"{run_str}_*.pt"))
-            chunk_files = [f for f in chunk_files if "_particle_prob" not in f.stem]
+            chunk_files = [f for f in chunk_files
+                           if "_particle_prob" not in f.stem and "_binary_prob" not in f.stem]
             chunks_to_load = [int(f.stem.split("_")[-1]) for f in chunk_files]
         else:
             chunks_to_load = args.chunks
@@ -486,11 +542,110 @@ def main():
         for data in dataset:
             y_oh = F.one_hot(data.pdg_label, num_classes=4).float()
             data.x = torch.cat([data.x, y_oh], dim=1)
+    if args.truth_label_2:
+        logger.info("Augmenting node features with binary truth label (2 classes: not_primary_EM / primary_EM_e).")
+        remap = torch.tensor([0, 0, 1, 0])
+        for data in dataset:
+            binary_label = remap[data.pdg_label]
+            y_oh = F.one_hot(binary_label, num_classes=2).float()
+            data.x = torch.cat([data.x, y_oh], dim=1)
+    if args.truth_label_3b:
+        logger.info("Augmenting node features with new 3-class truth label (other+mu / secondary_e / primary_EM_e).")
+        remap = torch.tensor([0, 1, 2, 0])
+        for data in dataset:
+            new3_label = remap[data.pdg_label]
+            y_oh = F.one_hot(new3_label, num_classes=3).float()
+            data.x = torch.cat([data.x, y_oh], dim=1)
     if args.faser_global:
         logger.info("Augmenting node features with global FASER features (injected to each node).")
         for data in dataset:
             faser_expanded = data.x_faser.unsqueeze(0).expand(data.num_nodes, -1)
             data.x = torch.cat([data.x, faser_expanded], dim=1)
+    if args.binary_prob_weights:
+        logger.info(f"Running binary classifier inference in-memory (weights: {args.binary_prob_weights}).")
+        ckpt = torch.load(args.binary_prob_weights, map_location=device, weights_only=False)
+        cfg = ckpt.get("model_config", {})
+        classifier = NeutrinoGravNetNodesFaser(
+            input_dim=1, num_node_classes=ckpt.get("num_node_classes", 2), faser_dim=5,
+            n_gravstack=cfg.get("n_gravstack", 3),
+            out_channels=cfg.get("out_channels", 16),
+            n_feature_transform=cfg.get("n_feature_transform", 16),
+            k=cfg.get("k", 12),
+        )
+        classifier.load_state_dict(ckpt["model_state_dict"])
+        classifier.to(device).eval()
+        with torch.no_grad():
+            for data in dataset:
+                batch_vec = torch.zeros(data.num_nodes, dtype=torch.long, device=device)
+                out = classifier(
+                    data.x.to(device),
+                    data.pos.to(device),
+                    batch_vec,
+                    data.x_faser.unsqueeze(0).to(device),
+                )
+                prob = torch.softmax(out, dim=1).cpu()
+                data.x = torch.cat([data.x, prob], dim=1)
+        del classifier
+        torch.cuda.empty_cache()
+        logger.info("Binary classifier augmentation complete.")
+    if args.truth3b_prob_weights:
+        logger.info(f"Running truth3b classifier inference in-memory (weights: {args.truth3b_prob_weights}).")
+        ckpt = torch.load(args.truth3b_prob_weights, map_location=device, weights_only=False)
+        cfg = ckpt.get("model_config", {})
+        classifier = NeutrinoGravNetNodesFaser(
+            input_dim=1, num_node_classes=ckpt.get("num_node_classes", 3), faser_dim=5,
+            n_gravstack=cfg.get("n_gravstack", 3),
+            out_channels=cfg.get("out_channels", 16),
+            n_feature_transform=cfg.get("n_feature_transform", 16),
+            k=cfg.get("k", 12),
+        )
+        classifier.load_state_dict(ckpt["model_state_dict"])
+        classifier.to(device).eval()
+        with torch.no_grad():
+            for data in dataset:
+                batch_vec = torch.zeros(data.num_nodes, dtype=torch.long, device=device)
+                out = classifier(
+                    data.x.to(device),
+                    data.pos.to(device),
+                    batch_vec,
+                    data.x_faser.unsqueeze(0).to(device),
+                )
+                prob = torch.softmax(out, dim=1).cpu()
+                data.x = torch.cat([data.x, prob], dim=1)
+        del classifier
+        torch.cuda.empty_cache()
+        logger.info("truth3b classifier augmentation complete.")
+    if args.classifier_embedding_weights:
+        logger.info(f"Running classifier embedding inference in-memory (weights: {args.classifier_embedding_weights}).")
+        ckpt = torch.load(args.classifier_embedding_weights, map_location=device, weights_only=False)
+        n_classes = ckpt["num_node_classes"]
+        cfg = ckpt.get("model_config", {})
+        classifier = NeutrinoGravNetNodesFaser(
+            input_dim=1, num_node_classes=n_classes, faser_dim=5,
+            n_gravstack=cfg.get("n_gravstack", 3),
+            out_channels=cfg.get("out_channels", 16),
+            n_feature_transform=cfg.get("n_feature_transform", 16),
+            k=cfg.get("k", 12),
+        )
+        classifier.load_state_dict(ckpt["model_state_dict"])
+        classifier.to(device).eval()
+        emb_dim = None
+        with torch.no_grad():
+            for data in dataset:
+                batch_vec = torch.zeros(data.num_nodes, dtype=torch.long, device=device)
+                _, embedding = classifier(
+                    data.x.to(device),
+                    data.pos.to(device),
+                    batch_vec,
+                    data.x_faser.unsqueeze(0).to(device),
+                    return_embedding=True,
+                )
+                data.x = torch.cat([data.x, embedding.cpu()], dim=1)
+                if emb_dim is None:
+                    emb_dim = embedding.shape[1]
+        del classifier
+        torch.cuda.empty_cache()
+        logger.info(f"Classifier embedding augmentation complete (embedding dim={emb_dim}).")
 
     # Split into train/val
     train_dataset, val_dataset = train_test_split(
@@ -557,6 +712,7 @@ def main():
         pooling=args.pooling,
         dropout=0.2,
         beta_loss=args.beta_loss,
+        use_faser=not args.no_faser_features,
     ).to(device)
 
     logger.info(f"Model: {model}")

@@ -1140,7 +1140,7 @@ class NeutrinoGravNetNodesFaser(nn.Module):
             nn.Linear(head_hidden // 2, num_node_classes),
         )
 
-    def forward(self, x, pos, batch, x_faser):
+    def forward(self, x, pos, batch, x_faser, return_embedding=False):
         """
         Forward pass for node-level classification with FASER data.
 
@@ -1149,9 +1149,13 @@ class NeutrinoGravNetNodesFaser(nn.Module):
             pos: Node positions [N, 3] (x, y, z coordinates)
             batch: Batch assignment vector [N] for batched graphs
             x_faser: FASER spectrometer features [batch_size, faser_dim]
+            return_embedding: if True, also return the pre-classifier node embedding
+                              [N, n_gravstack*out_channels + 8] alongside the logits
 
         Returns:
             node_out: Node predictions [N, num_node_classes]
+            embedding (optional): [N, n_gravstack*out_channels + 8] — returned only
+                                  when return_embedding=True
         """
         # Create batch tensor if not provided
         if batch is None:
@@ -1189,11 +1193,13 @@ class NeutrinoGravNetNodesFaser(nn.Module):
         x_faser_broadcast = x_faser_processed[batch]  # [N, 8]
         x_node_combined = torch.cat(
             [x, x_faser_broadcast], dim=1
-        )  # [N, concat_features + 8]
+        )  # [N, n_gravstack*out_channels + 8]
 
         # Node-level classification
         node_out = self.node_classifier(x_node_combined)
 
+        if return_embedding:
+            return node_out, x_node_combined
         return node_out
 
 
@@ -1227,6 +1233,7 @@ class NeutrinoGravNetRegressionFASER(nn.Module):
         n_gravstack: int = 3,
         batchnorm_momentum: float = 0.05,
         beta_loss: bool = False,
+        use_faser: bool = True,
     ):
         """
         Args:
@@ -1246,6 +1253,7 @@ class NeutrinoGravNetRegressionFASER(nn.Module):
         """
         super().__init__()
         self.beta_loss = beta_loss
+        self.use_faser = use_faser
 
         # Input will be [features, x, y, z] concatenated
         input_with_pos = input_dim + 3
@@ -1302,18 +1310,19 @@ class NeutrinoGravNetRegressionFASER(nn.Module):
         else:
             raise ValueError(f"Unknown pooling method: {pooling}")
 
-        # FASER feature processing
-        self.faser_mlp = nn.Sequential(
-            nn.Linear(faser_dim, 16),
-            nn.SiLU(),
-            nn.Linear(16, 16),
-            nn.SiLU(),
-            nn.Linear(16, 8),
-            nn.SiLU(),
-        )
-
-        # Regression head (graph features + processed FASER features)
-        combined_features = concat_features + 8
+        # FASER feature processing (only when use_faser=True)
+        if use_faser:
+            self.faser_mlp = nn.Sequential(
+                nn.Linear(faser_dim, 16),
+                nn.SiLU(),
+                nn.Linear(16, 16),
+                nn.SiLU(),
+                nn.Linear(16, 8),
+                nn.SiLU(),
+            )
+            combined_features = concat_features + 8
+        else:
+            combined_features = concat_features
 
         self.regression_head = nn.Sequential(
             nn.Linear(combined_features, 32),
@@ -1326,7 +1335,7 @@ class NeutrinoGravNetRegressionFASER(nn.Module):
             # No final activation — softplus applied to alpha/beta in forward when beta_loss=True
         )
 
-    def forward(self, x, pos, batch, x_faser):
+    def forward(self, x, pos, batch, x_faser=None):
         """
         Forward pass for energy regression with FASER data.
 
@@ -1334,7 +1343,7 @@ class NeutrinoGravNetRegressionFASER(nn.Module):
             x: Node features [N, input_dim] (e.g., energy)
             pos: Node positions [N, 3] (x, y, z coordinates)
             batch: Batch assignment vector [N] for batched graphs
-            x_faser: FASER spectrometer features [batch_size, faser_dim]
+            x_faser: FASER spectrometer features [batch_size, faser_dim] (ignored when use_faser=False)
 
         Returns:
             predictions: Regression predictions [batch_size, num_targets]
@@ -1381,14 +1390,15 @@ class NeutrinoGravNetRegressionFASER(nn.Module):
         # Global pooling for graph-level prediction
         x_pooled = self.graph_pooling(x, batch)  # [batch_size, n_gravstack * out_channels]
 
-        # Process FASER features
-        # PyG concatenates graph-level [5] tensors flat to [batch_size*5]
-        batch_size = x_pooled.size(0)
-        x_faser_reshaped = x_faser.view(batch_size, -1)  # [batch_size, faser_dim]
-        x_faser_processed = self.faser_mlp(x_faser_reshaped)  # [batch_size, 8]
-
-        # Combine graph features and FASER features
-        x_combined = torch.cat([x_pooled, x_faser_processed], dim=1)
+        # Process FASER features (ablation: skip when use_faser=False)
+        if self.use_faser:
+            # PyG concatenates graph-level [5] tensors flat to [batch_size*5]
+            batch_size = x_pooled.size(0)
+            x_faser_reshaped = x_faser.view(batch_size, -1)  # [batch_size, faser_dim]
+            x_faser_processed = self.faser_mlp(x_faser_reshaped)  # [batch_size, 8]
+            x_combined = torch.cat([x_pooled, x_faser_processed], dim=1)
+        else:
+            x_combined = x_pooled
 
         # Regression prediction
         out = self.regression_head(x_combined)
