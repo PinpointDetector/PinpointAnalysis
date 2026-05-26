@@ -67,7 +67,7 @@ def compute_class_weights(dataset):
     return weights
 
 
-def train_epoch(model, loader, optimizer, device, class_weights, accumulation_steps=1):
+def train_epoch(model, loader, optimizer, device, class_weights, accumulation_steps=1, per_event_weighting=False):
     """Train for one epoch with optional gradient accumulation."""
     model.train()
     total_loss = 0
@@ -79,7 +79,13 @@ def train_epoch(model, loader, optimizer, device, class_weights, accumulation_st
         data = data.to(device)
         try:
             node_out = model(data.x, data.pos, data.batch, data.x_faser)
-            loss = F.cross_entropy(node_out, data.binary_label, weight=class_weights)
+            if per_event_weighting:
+                counts = data.binary_label.bincount(minlength=NUM_NODE_CLASSES).float()
+                w = (1.0 / (counts + 1e-6))
+                w = (w / w.sum() * NUM_NODE_CLASSES).to(device)
+            else:
+                w = class_weights
+            loss = F.cross_entropy(node_out, data.binary_label, weight=w)
             pred = node_out.argmax(dim=1)
             correct += (pred == data.binary_label).sum().item()
             total += data.binary_label.size(0)
@@ -106,7 +112,7 @@ def train_epoch(model, loader, optimizer, device, class_weights, accumulation_st
     return avg_loss, acc
 
 
-def validate_epoch(model, loader, device, class_weights):
+def validate_epoch(model, loader, device, class_weights, per_event_weighting=False):
     """Validate; returns loss, accuracy, AUC-ROC, per-class metrics."""
     model.eval()
     total_loss = 0
@@ -121,7 +127,13 @@ def validate_epoch(model, loader, device, class_weights):
             data = data.to(device)
             try:
                 node_out = model(data.x, data.pos, data.batch, data.x_faser)
-                loss = F.cross_entropy(node_out, data.binary_label, weight=class_weights)
+                if per_event_weighting:
+                    counts = data.binary_label.bincount(minlength=NUM_NODE_CLASSES).float()
+                    w = (1.0 / (counts + 1e-6))
+                    w = (w / w.sum() * NUM_NODE_CLASSES).to(device)
+                else:
+                    w = class_weights
+                loss = F.cross_entropy(node_out, data.binary_label, weight=w)
                 pred = node_out.argmax(dim=1)
                 prob = torch.softmax(node_out, dim=1)[:, 1]  # P(primary_EM_e)
 
@@ -195,17 +207,30 @@ def main():
     )
     parser.add_argument("--suffix", type=str, default=None,
         help="Optional suffix appended to output directory name")
+    parser.add_argument("--per-event-weighting", action="store_true", default=False,
+        help="Use per-event class weights (n_neg/n_pos per batch) instead of global dataset weights")
     # Model hyperparameters
     parser.add_argument("--n-gravstack",         type=int, default=3)
     parser.add_argument("--out-channels",        type=int, default=16)
     parser.add_argument("--n-feature-transform", type=int, default=16)
     parser.add_argument("--k",                   type=int, default=12)
     parser.add_argument("--accumulation-steps",  type=int, default=1)
+    parser.add_argument(
+        "--vertex-dist",
+        action="store_true",
+        default=False,
+        help="Append ground-truth distance from each node to the true neutrino interaction "
+             "vertex as an additional node feature. Upper-bound study only — uses Geant4 truth.",
+    )
     args = parser.parse_args()
 
     # ── Paths ─────────────────────────────────────────────────────────────────
     torch_path = get_torch_path()
     dir_name = "gravnet_binary_classifier_faser"
+    if args.vertex_dist:
+        dir_name += "_vertexdist"
+    if args.per_event_weighting:
+        dir_name += "_perevtweight"
     if args.suffix:
         dir_name += f"_{args.suffix}"
 
@@ -264,6 +289,13 @@ def main():
                 # Derive binary label in-memory: 1=primary_EM_e, 0=everything else
                 for d in chunk_data:
                     d.binary_label = (d.pdg_label == 2).long()
+                    if args.vertex_dist:
+                        # data.pos [N,3] and data.true_pos_centered [3] share the same
+                        # normalisation frame (centred at pos_mean, divided by 100 mm)
+                        vertex_dist = torch.norm(
+                            d.pos - d.true_pos_centered.unsqueeze(0), dim=1, keepdim=True
+                        )  # [N, 1]
+                        d.x = torch.cat([d.x, vertex_dist], dim=1)  # [N, 2]
                 dataset.extend(chunk_data)
                 logger.info(f"  chunk {chunk}: {len(chunk_data)} events")
             else:
@@ -347,9 +379,11 @@ def main():
         train_loss, train_acc = train_epoch(
             model, train_loader, optimizer, device, class_weights,
             accumulation_steps=args.accumulation_steps,
+            per_event_weighting=args.per_event_weighting,
         )
         val_loss, val_acc, val_auc, val_per_class_acc, val_precision, val_recall, val_f1 = validate_epoch(
             model, val_loader, device, class_weights,
+            per_event_weighting=args.per_event_weighting,
         )
         scheduler.step(val_loss)
 

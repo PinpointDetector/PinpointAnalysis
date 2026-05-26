@@ -404,6 +404,13 @@ def main():
              "appending [P(other_mu), P(secondary_e), P(primary_EM_e)] to each node's features.",
     )
     parser.add_argument(
+        "--vertex-dist",
+        action="store_true",
+        default=False,
+        help="Append ground-truth distance from each node to the true neutrino interaction "
+             "vertex as an additional node feature. Upper-bound study only — uses Geant4 truth.",
+    )
+    parser.add_argument(
         "--classifier-embedding-weights",
         type=str,
         default=None,
@@ -457,6 +464,8 @@ def main():
         parts.append("binaryprob")
     if args.truth3b_prob_weights:
         parts.append("truth3bprob")
+    if args.vertex_dist:
+        parts.append("vertexdist")
     if args.classifier_embedding_weights:
         parts.append("embedding")
     if args.beta_loss:
@@ -530,6 +539,18 @@ def main():
                 logger.warning(f"  Chunk file not found: {chunk_file}")
 
     logger.info(f"Total loaded events: {len(dataset)}")
+
+    # Optionally augment node features with ground-truth vertex distance
+    if args.vertex_dist:
+        logger.info("Augmenting node features with ground-truth vertex distance.")
+        for data in dataset:
+            # data.pos [N,3] and data.true_pos_centered [3] share the same
+            # normalisation frame (centred at pos_mean, divided by 100 mm)
+            vertex_dist = torch.norm(
+                data.pos - data.true_pos_centered.unsqueeze(0), dim=1, keepdim=True
+            )  # [N, 1]
+            data.x = torch.cat([data.x, vertex_dist], dim=1)  # [N, 2]
+        logger.info("Vertex distance augmentation complete.")
 
     # Optionally augment node features with one-hot truth labels
     if args.truth_label:

@@ -202,10 +202,19 @@ def main():
     parser.add_argument("--n-feature-transform", type=int, default=16)
     parser.add_argument("--k",                   type=int, default=12)
     parser.add_argument("--accumulation-steps",  type=int, default=1)
+    parser.add_argument(
+        "--vertex-dist",
+        action="store_true",
+        default=False,
+        help="Append ground-truth distance from each node to the true neutrino interaction "
+             "vertex as an additional node feature. Upper-bound study only — uses Geant4 truth.",
+    )
     args = parser.parse_args()
 
     torch_path = get_torch_path()
     dir_name = "gravnet_truth3b_classifier_faser"
+    if args.vertex_dist:
+        dir_name += "_vertexdist"
     if args.suffix:
         dir_name += f"_{args.suffix}"
 
@@ -262,6 +271,11 @@ def main():
                     chunk_data = chunk_data[: args.num_events]
                 for d in chunk_data:
                     d.label_3b = LABEL_REMAP[d.pdg_label]
+                    if args.vertex_dist:
+                        vertex_dist = torch.norm(
+                            d.pos - d.true_pos_centered.unsqueeze(0), dim=1, keepdim=True
+                        )  # [N, 1]
+                        d.x = torch.cat([d.x, vertex_dist], dim=1)  # [N, 2]
                 dataset.extend(chunk_data)
                 logger.info(f"  chunk {chunk}: {len(chunk_data)} events")
             else:
